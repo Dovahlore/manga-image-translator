@@ -1,0 +1,60 @@
+# ============================================================
+# manga-image-translator —— Blackwell / RTX 50 系（sm_120）适配镜像
+#
+# 上游 Dockerfile 的基镜像是 pytorch 2.5.1 + CUDA 11.8， CUDA 11.8 不认识
+# sm_120，在 RTX 5070 上会退化成 CPU 运行（或直接报 no kernel image）。
+# 这里换成 CUDA 12.8 基镜像，才能吃到 50 系的 GPU。
+#
+# 与上游 Dockerfile 的另外两点差别：
+#   1. 不装 gimp（省 ~400MB 和大量构建时间）——只有 renderer=gimp 才需要它
+#   2. 不在构建期下载模型，模型改为运行时挂载 /app/models（见 mit-docker.ps1）
+#      → 镜像小、构建快、模型可复用、不污染 OneDrive
+#
+# 构建： docker build -f Dockerfile.cu128 -t mit:cu128 .
+# 或直接： powershell -File mit-docker.ps1 build
+# ============================================================
+
+ARG BASE_IMAGE=pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
+FROM ${BASE_IMAGE}
+
+ARG RUSTY_INDEX=https://frederik-uni.github.io/manga-image-translator-rust/python/wheels/simple/
+# 国内构建建议走清华 PyPI 镜像；想用官方源就 --build-arg PIP_INDEX_URL=https://pypi.org/simple
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+# 构建期可选代理，例如 http://host.docker.internal:7897（需 Clash 打开“允许局域网连接”）
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Etc/UTC \
+    PYTHONUNBUFFERED=1 \
+    PYTHONUTF8=1 \
+    PYTHONPATH=/app \
+    HF_HOME=/app/models/hf
+
+WORKDIR /app
+
+# g++        : pydensecrf 需要从源码编译
+# libvulkan1 : waifu2x / Real-ESRGAN 的 ncnn-vulkan 可执行文件需要
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      g++ ffmpeg libsm6 libxext6 libgl1 libglib2.0-0 libvulkan1 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /app/requirements.txt
+
+# rusty-manga-image-translator 是 detection/common_rust.py 的模块级导入，
+# 装不上整个程序都起不来；它托管在 GitHub Pages 的私有 index 上，
+# 所以单独一步安装，失败信息更清楚。
+RUN python -m pip install --no-cache-dir -i "${PIP_INDEX_URL}" --upgrade pip setuptools wheel \
+ && grep -v '^rusty-manga-image-translator' /app/requirements.txt > /tmp/req-main.txt \
+ && python -m pip install --no-cache-dir -i "${PIP_INDEX_URL}" -r /tmp/req-main.txt \
+ && python -m pip install --no-cache-dir -i "${PIP_INDEX_URL}" --extra-index-url "${RUSTY_INDEX}" rusty-manga-image-translator \
+ && python -c "import rusty_manga_image_translator, torch; print('rusty OK; torch', torch.__version__, 'cuda', torch.version.cuda, 'avail', torch.cuda.is_available())"
+
+COPY . /app
+
+# 模型目录：运行时挂载；HF_HOME 也指到里面，manga-ocr / lama 权重跟着一起持久化
+VOLUME ["/app/models"]
+
+ENTRYPOINT ["python", "-m", "manga_translator"]
+CMD ["--help"]

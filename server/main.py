@@ -1,3 +1,4 @@
+import base64
 import io
 import os
 import secrets
@@ -12,6 +13,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 
 from fastapi import FastAPI, Request, HTTPException, Header, UploadFile, File, Form
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -123,6 +125,36 @@ async def image_form(req: Request, image: UploadFile = File(...), config: str = 
     img_byte_arr.seek(0)
 
     return StreamingResponse(img_byte_arr, media_type="image/png")
+
+
+class PageTranslateResponse(BaseModel):
+    """一次管线运行同时返回译文图 + 结构化结果，供上层 App 服务调用。"""
+    image_b64: str
+    result: TranslationResponse
+
+
+@app.post("/translate/with-form/page", response_model=PageTranslateResponse, tags=["api", "form"],
+          response_description="one-shot: translated image (base64) + structured translations")
+async def page_form(req: Request, image: UploadFile = File(...), config: str = Form("{}")):
+    """
+    一条龙接口：跑完检测/OCR/翻译/抹字/嵌字后，一次返回两样东西：
+      - image_b64: 译文图（PNG, base64）
+      - result:    每个文本块的 bbox / 原文 / 译文 / 颜色 / 角度
+    这样调用方不用为了拿图片和拿文本各跑一次管线（每次约 10~20 秒）。
+    """
+    img = await image.read()
+    conf = Config.parse_raw(config)
+    ctx = await get_ctx(req, conf, img)
+    buf = io.BytesIO()
+    # PIL 需要显式 seek(0)，否则空图
+    if ctx.result is None:
+        raise HTTPException(500, detail="translation produced no image")
+    ctx.result.save(buf, format="PNG")
+    return PageTranslateResponse(
+        image_b64=base64.b64encode(buf.getvalue()).decode(),
+        result=to_translation(ctx),
+    )
+
 
 @app.post("/translate/with-form/json/stream", response_class=StreamingResponse, tags=["api", "form"],response_description="A stream over elements with strucure(1byte status, 4 byte size, n byte data) status code are 0,1,2,3,4 0 is result data, 1 is progress report, 2 is error, 3 is waiting queue position, 4 is waiting for translator instance")
 async def stream_json_form(req: Request, image: UploadFile = File(...), config: str = Form("{}")) -> StreamingResponse:
@@ -284,6 +316,13 @@ def prepare(args):
         nonce = os.getenv('MT_WEB_NONCE', generate_nonce())
     else:
         nonce = args.nonce
+    # 共享给 server.instance：网关 -> worker 的内部调用必须带 X-Nonce
+    # （原因见 server/nonce_state.py，上游漏了这个头会 401）
+    try:
+        from server import nonce_state
+        nonce_state.nonce = nonce
+    except Exception:
+        pass
     if args.start_instance:
         return start_translator_client_proc(args.host, args.port + 1, nonce, args)
     folder_name= "upload-cache"

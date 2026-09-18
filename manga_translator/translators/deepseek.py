@@ -235,6 +235,18 @@ class DeepseekTranslator(CommonGPTTranslator):
         messages = [  
             {'role': 'system', 'content': system_message},  
         ]  
+
+        # 术语表：与 chatgpt 一致的做法（由 GlossaryMixin 提供，见 glossary_mixin.py）。
+        # 注意：DeepSeek 自己手搓 messages、不走父类 _assemble_request，
+        # 所以上游那套术语表/上下文以前对它完全没生效，这里显式注入。
+        has_glossary, glossary_msg = self.build_glossary_message(prompt)
+        if has_glossary:
+            messages.append({'role': 'system', 'content': glossary_msg})
+
+        # 跨页上下文：由 manga_translator._dispatch_with_context / _batch_translate_texts 注入
+        if getattr(self, 'prev_context', None):
+            messages.append({'role': 'system', 'content': self.prev_context})
+
         lang_chat_samples = self.get_chat_sample(to_lang)
         if lang_chat_samples:
             messages.append({'role': 'user', 'content': lang_chat_samples[0]})

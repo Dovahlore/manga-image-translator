@@ -5,7 +5,15 @@ from typing import List
 
 from .ballon_extractor import extract_ballon_region
 from ..utils import TextBlock
-from .text_render_eng import seg_eng
+from .text_render_eng import seg_eng, _is_cjk
+
+
+def _join_sep(left: str, right: str) -> str:
+    """中日文之间不插空格，其它情况（拉丁词之间）插一个空格。"""
+    if left and right and _is_cjk(left[-1]) and _is_cjk(right[0]):
+        return ''
+    return ' '
+
 
 def merge_seg_eng(text: str, font, bbox_width, size_ratio=1.2) -> List[str]:
     """Segments text into words that fit within bbox_width"""
@@ -15,7 +23,7 @@ def merge_seg_eng(text: str, font, bbox_width, size_ratio=1.2) -> List[str]:
     text_max_width = max([font.getbbox(word)[2] - font.getbbox(word)[0] for word in grouped])
     max_width = max(bbox_width, text_max_width) * size_ratio
     for word in grouped:
-        test_line = f"{current_line} {word}" if current_line else word
+        test_line = current_line + _join_sep(current_line, word) + word if current_line else word
         width = font.getbbox(test_line)[2] - font.getbbox(test_line)[0]
         if width <= max_width:
             current_line = test_line

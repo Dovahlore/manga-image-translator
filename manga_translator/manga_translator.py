@@ -1015,7 +1015,9 @@ class MangaTranslator:
 
         # 构建上下文字符串
         # Build the context string
-        prev_ctx = self._build_prev_context()
+        # 优先使用调用方（App）直接传入的上下文：服务端进程内的历史是全局的，
+        # 多本书/多用户混用时会串味，所以允许上层完全接管（config.context_text）。
+        prev_ctx = getattr(config, 'context_text', None) or self._build_prev_context()
 
         # 如果是 ChatGPT 或 ChatGPT2Stage 翻译器，则专门处理上下文注入
         # Special handling for ChatGPT and ChatGPT2Stage translators: inject context
@@ -1046,6 +1048,21 @@ class MangaTranslator:
             else:
                 return await translator._translate(ctx.from_lang, config.translator.target_lang, texts)
 
+
+        # 其它 GPT 类翻译器（deepseek / gemini / groq / custom_openai ...）同样需要上下文：
+        # 上游只处理了 chatgpt / chatgpt_2stage 的白名单，这里在“缓存实例”上设置
+        # prev_context —— dispatch_translation 复用的正是同一个缓存实例，所以能生效。
+        from .translators import get_translator
+        try:
+            _t = get_translator(config.translator.translator)
+            if hasattr(_t, 'set_prev_context') and prev_ctx:
+                _t.set_prev_context(prev_ctx)
+                logger.info(
+                    f"Injected previous-page context into '{config.translator.translator}' "
+                    f"translator ({len(prev_ctx)} chars, {pages_used} pages)"
+                )
+        except Exception as _e:
+            logger.warning(f"Failed to inject context into translator: {_e}")
 
         return await dispatch_translation(
             config.translator.translator_gen,
@@ -1368,12 +1385,24 @@ class MangaTranslator:
         self._model_usage_timestamps[("rendering", config.render.renderer)] = current_time
         if config.render.renderer == Renderer.none:
             output = ctx.img_inpainted
-        # manga2eng currently only supports horizontal left to right rendering
-        elif (config.render.renderer == Renderer.manga2Eng or config.render.renderer == Renderer.manga2EngPillow) and ctx.text_regions and LANGUAGE_ORIENTATION_PRESETS.get(ctx.text_regions[0].target_lang) == 'h':
+        # manga2eng / manga2eng_pillow：按检测到的**气泡**排版并把字缩放到装得下
+        # （render_textblock_list_eng 里的 downscale_constraint / ballonarea_thresh）。
+        # 上游只放开 preset == 'h' 的语言（英文等），CHS/CHT/JPN 的 preset 是 'auto'
+        # 就被静默忽略 → 中文永远走不到这条"缩字适配"的路径。这里把 'auto' 一起放开，
+        # 同时给按字断行 + CJK 字体（见 text_render_eng.seg_eng / dispatch_eng_render）。
+        _preset = LANGUAGE_ORIENTATION_PRESETS.get(ctx.text_regions[0].target_lang) if ctx.text_regions else None
+        _eng_renderer = config.render.renderer in (Renderer.manga2Eng, Renderer.manga2EngPillow)
+        if _eng_renderer and ctx.text_regions and _preset in ('h', 'auto'):
+            # 非 Pillow 版默认字体是 comic shanns 2.ttf（纯拉丁），画中文会是豆腐块
+            _font_path = self.font_path
+            if not _font_path and config.render.renderer == Renderer.manga2Eng and _preset == 'auto':
+                _font_path = os.path.join(BASE_PATH, 'fonts/NotoSansMonoCJK-VF.ttf.ttc')
             if config.render.renderer == Renderer.manga2EngPillow:
-                output = await dispatch_eng_render_pillow(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions, self.font_path, config.render.line_spacing)
+                output = await dispatch_eng_render_pillow(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions,
+                                                          _font_path, config.render.line_spacing)
             else:
-                output = await dispatch_eng_render(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions, self.font_path, config.render.line_spacing)
+                output = await dispatch_eng_render(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions,
+                                                   _font_path, config.render.line_spacing)
         else:
             output = await dispatch_rendering(ctx.img_inpainted, ctx.text_regions, self.font_path, config.render.font_size,
                                               config.render.font_size_offset,
@@ -2268,7 +2297,8 @@ class MangaTranslator:
             translator.parse_args(config.translator)
 
             # 构建上下文 - 在并发模式下使用原文和页面索引
-            prev_ctx = self._build_prev_context(
+            # （上层传入的 context_text 优先）
+            prev_ctx = getattr(config, 'context_text', None) or self._build_prev_context(
                 use_original_text=use_original_text,
                 current_page_index=page_index,
                 batch_index=batch_index,
@@ -2341,6 +2371,27 @@ class MangaTranslator:
 
         else:
             # 使用通用翻译调度器
+            # 非 chatgpt 的 GPT 类翻译器（deepseek / gemini / groq / custom_openai）同样需要跨页上下文：
+            # dispatch_translation 内部复用 get_translator 的缓存实例，所以在这里设置即可生效。
+            from .translators import get_translator
+            try:
+                _t = get_translator(config.translator.translator)
+                if hasattr(_t, 'set_prev_context') and self.context_size > 0:
+                    _prev = self._build_prev_context(
+                        use_original_text=(self.batch_concurrent and self.batch_size > 1),
+                        current_page_index=page_index,
+                        batch_index=batch_index,
+                        batch_original_texts=batch_original_texts,
+                    )
+                    if _prev:
+                        _t.set_prev_context(_prev)
+                        logger.info(
+                            f"Injected previous-page context into '{config.translator.translator}' "
+                            f"translator (batch path, {len(_prev)} chars)"
+                        )
+            except Exception as _e:
+                logger.warning(f"Failed to inject context (batch path): {_e}")
+
             return await dispatch_translation(
                 config.translator.translator_gen,
                 texts,

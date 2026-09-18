@@ -1,4 +1,5 @@
 import asyncio
+import os
 import pickle
 import io
 import secrets
@@ -18,6 +19,10 @@ SAFE_PICKLE_MODULES = frozenset({
     'numpy',
     'numpy.core.multiarray',
     'numpy.dtype',
+    'shapely',
+    'shapely.io',
+    'shapely.geometry',
+    'shapely.lib',
     'manga_translator',
     'manga_translator.utils',
     'manga_translator.utils.generic',
@@ -25,8 +30,15 @@ SAFE_PICKLE_MODULES = frozenset({
 })
 
 class RestrictedUnpickler(pickle.Unpickler):
+    # 放行的模块前缀：
+    #   PIL.*            图片对象
+    #   shapely.*        文字区域的几何对象（shapely.io.from_wkb 等）
+    #   manga_translator.*  本项目自己的类（textblock.TextBlock、utils.generic.Context 等），
+    #                      网关与 worker 跑的是同一份代码，必须能反序列化
+    SAFE_PREFIXES = ('PIL.', 'shapely.', 'manga_translator.')
+
     def find_class(self, module: str, name: str):
-        if module in SAFE_PICKLE_MODULES or module.startswith('PIL.'):
+        if module in SAFE_PICKLE_MODULES or module.startswith(self.SAFE_PREFIXES):
             return super().find_class(module, name)
         raise pickle.UnpicklingError(
             f"Deserialization of {module}.{name} is not allowed"
@@ -46,6 +58,17 @@ class MethodCall(BaseModel):
 
 class MangaShare:
     def __init__(self, params: dict = None):
+        params = dict(params or {})
+        # 让“网页/API”这条路也能启用跨页上下文：
+        # --context-size 是 CLI 参数，server/main.py 启动 worker 时不会传，所以用环境变量补。
+        # 在容器里设 MIT_CONTEXT_SIZE=1 即表示“翻译每一页时带上前一页作为参考”。
+        if 'context_size' not in params:
+            _cs = os.environ.get('MIT_CONTEXT_SIZE')
+            if _cs:
+                try:
+                    params['context_size'] = int(_cs)
+                except ValueError:
+                    pass
         self.manga = MangaTranslator(params)
         self.host = params.get('host', '127.0.0.1')
         self.port = int(params.get('port', '5003'))
@@ -141,6 +164,11 @@ class MangaShare:
             self.check_lock()
             method = self.get_fn(method_name)
             attr = restricted_loads(await request.body())
+            # 非流式调用：必须清掉上一次流式请求留下的占位符开关。
+            # `_is_streaming_mode` 挂在常驻实例上（见 /execute 路由），网页端流式翻译一次
+            # 就会把它置 True，而本路由从不清它 —— 结果之后每个非流式请求
+            # （App 接口、脚本、comicread 等）都只拿到 1x1 白图占位符。
+            self.manga._is_streaming_mode = False
             try:
                 if asyncio.iscoroutinefunction(method):
                     result = await method(**attr)

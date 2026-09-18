@@ -28,10 +28,21 @@ async def fetch_data(url, image: Image, config: Config, headers: Mapping[str, st
     async with aiohttp.ClientSession() as session:
         async with session.post(url, data=data, headers=headers) as response:
             if response.status == 200:
+                raw = await response.read()
+                # worker 的 /simple_execute/* 返回的是 pickle 字节流（manga_translator/mode/share.py:151），
+                # 上游这里却用 json.loads(response.text()) 解析，于是必然抛
+                # "'utf-8' codec can't decode byte 0x80（pickle 协议头）"，
+                # 导致所有非流式翻译接口 500（流式接口走 streaming.py，不受影响）。
+                # 这里先按 JSON 试（兼容其他实现），失败再按受限 pickle 反序列化。
                 try:
-                    return json.loads(await response.text())
-                except json.JSONDecodeError:
-                    raise HTTPException(502, detail='Invalid JSON response from upstream')
+                    return json.loads(raw.decode('utf-8'))
+                except Exception:
+                    pass
+                try:
+                    from manga_translator.mode.share import restricted_loads
+                    return restricted_loads(raw)
+                except Exception as e:
+                    raise HTTPException(502, detail='Invalid response from upstream: %s' % e)
             else:
                 raise HTTPException(response.status, detail=await response.text())
 

@@ -322,6 +322,10 @@ class Config(BaseModel):
     # General
     filter_text: Optional[str] = None
     """Filter regions by their text with a regex. Example usage: '.*badtext.*'"""
+    context_text: Optional[str] = None
+    """跨页上下文文本，由上层（App 服务）组装后传入，格式：
+    'Here are the previous ... for reference:\\n<|1|>句子\\n<|2|>句子'。
+    传了就直接用它，不再使用服务端进程内的历史 —— 避免多本书/多用户互相串味。"""
     render: RenderConfig = RenderConfig()
     """render configs"""
     upscale: UpscaleConfig = UpscaleConfig()

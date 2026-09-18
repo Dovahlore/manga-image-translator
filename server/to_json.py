@@ -85,7 +85,10 @@ class TranslationResponse(BaseModel):
         return struct.pack('i', len(items)) + b''.join(items)
 
 def to_translation(ctx: Context) -> TranslationResponse:
-    text_regions:list[TextBlock] = ctx.text_regions
+    # 无文字页（整页插图/跨页图）时 text_regions 是 None，上游这里会
+    # TypeError: 'NoneType' object is not iterable -> 引擎 500 -> 调用方 502。
+    # 兜底成空列表，让"没有文字"这种正常情况返回 image + 空 translations。
+    text_regions:list[TextBlock] = ctx.text_regions or []
     inpaint = ctx.img_inpainted
     translations:Dict[str, List[str]] = ctx.translations
     results = []

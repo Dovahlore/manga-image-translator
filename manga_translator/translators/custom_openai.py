@@ -12,9 +12,10 @@ import time
 from typing import List
 from .common import CommonTranslator, VALID_LANGUAGES
 from .keys import CUSTOM_OPENAI_API_KEY, CUSTOM_OPENAI_API_BASE, CUSTOM_OPENAI_MODEL, CUSTOM_OPENAI_MODEL_CONF
+from .glossary_mixin import GlossaryMixin
 
 
-class CustomOpenAiTranslator(ConfigGPT, CommonTranslator):
+class CustomOpenAiTranslator(GlossaryMixin, ConfigGPT, CommonTranslator):
     _INVALID_REPEAT_COUNT = 2  # 如果检测到"无效"翻译，最多重复 2 次
     _MAX_REQUESTS_PER_MINUTE = 40  # 每分钟最大请求次数
     _TIMEOUT = 40  # 在重试之前等待服务器响应的时间（秒）
@@ -41,6 +42,8 @@ class CustomOpenAiTranslator(ConfigGPT, CommonTranslator):
         ConfigGPT.__init__(self, config_key=_CONFIG_KEY)
         self.model = model
         CommonTranslator.__init__(self)
+        # 术语表（glossary_mixin）：上游只在 chatgpt 里接过，这里让 custom_openai（含本地 Ollama）也能用
+        self.init_glossary()
         self.client = openai.AsyncOpenAI(api_key=api_key or CUSTOM_OPENAI_API_KEY or "ollama") # required, but unused for ollama
         self.client.base_url = api_base or CUSTOM_OPENAI_API_BASE
         self.token_count = 0
@@ -216,6 +219,14 @@ class CustomOpenAiTranslator(ConfigGPT, CommonTranslator):
 
     async def _request_translation(self, to_lang: str, prompt: str) -> str:
         messages = [{'role': 'system', 'content': self.chat_system_template.format(to_lang=to_lang)}]
+
+        # 术语表 + 跨页上下文：上游只在 chatgpt.py 里接了这套，
+        # 其它 GPT 类翻译器（含指向本地 Ollama 的 custom_openai）以前静默无效。见 glossary_mixin.py
+        has_glossary, glossary_msg = self.build_glossary_message(prompt)
+        if has_glossary:
+            messages.append({'role': 'system', 'content': glossary_msg})
+        if getattr(self, 'prev_context', None):
+            messages.append({'role': 'system', 'content': self.prev_context})
 
         # Add chat samples if available
         lang_chat_samples = self.get_chat_sample(to_lang)

@@ -1,0 +1,169 @@
+# ============================================================
+#  mit 全栈 —— 一条命令起「引擎 + MySQL + Redis + App 接口」
+#
+#    docker compose --env-file app.env -f docker-compose.full.yml up -d
+#    docker compose --env-file app.env -f docker-compose.full.yml ps
+#    docker compose --env-file app.env -f docker-compose.full.yml logs -f engine
+#    docker compose --env-file app.env -f docker-compose.full.yml down
+#
+#  或用封装脚本（推荐，省得记这些参数）：
+#    .\mit-app.ps1 up | down | status | logs | engine-logs | build | test | sql | redis
+#
+#  兼容老文件名：docker-compose.app.yml 现在只是 include 本文件。
+#  mit-docker.ps1 仍可用（build/probe/gpu-test/net-test/cli/shell/api），
+#  但它的 up/down/restart/logs 已经改成转发到本文件，避免两套东西抢同一个容器名。
+#
+#  ★ 数据全部放在**项目目录内**的 _runtime\ 下，不往 D:\ 根目录散
+#    （_runtime/ 与 secret.env 已加进 .gitignore）
+#
+#    宿主路径                                内容                          容器内
+#    _runtime\models                         模型权重（约 4.8GB）+ HF 缓存  engine:/app/models
+#    _runtime\data\app                       books/ 与 cache/              app-api:/data
+#    _runtime\data\mysql                     MySQL 数据目录                 app-db:/var/lib/mysql
+#    _runtime\data\redis                     Redis AOF                     app-redis:/data
+#    _runtime\work\input / output            （可选）批处理输入输出         engine:/input, /output
+#    secret.env                              引擎密钥（DEEPSEEK_API_KEY）   注入 engine 环境变量
+#
+#    改到别处：在 app.env 里设 MIT_RUNTIME=D:/mit 即可整棵搬走（见文件末尾的 volumes 段）。
+#
+#  变量来源：
+#    --env-file app.env   -> 端口/账号密码/路径（gitignored）
+#    ./secret.env         -> 引擎密钥（DEEPSEEK_API_KEY 等，gitignored）
+#
+#  服务名 -> 容器名 -> 宿主端口：
+#    engine    mit-engine    8010  （容器内 8000，Web UI + API）
+#    app-api   mit-app-api   8020  （App 接口）
+#    app-db    mit-app-db    127.0.0.1:33063
+#    app-redis mit-app-redis 127.0.0.1:56379
+#
+#  注意：app-api 通过**服务名** engine:8000 访问引擎，不再绕
+#  host.docker.internal:8010 —— 少一跳 NAT，也不依赖 Docker Desktop 的宿主机别名。
+# ============================================================
+
+name: mit
+
+services:
+  # ---------- 引擎：检测 / OCR / 翻译 / 抹字 / 嵌字（GPU 常驻） ----------
+  engine:
+    image: mit:cu128
+    container_name: mit-engine
+    build:
+      context: .
+      dockerfile: Dockerfile.cu128
+      # 指定基镜像可跳过联网预检（BuildKit 从本地构建缓存解析这个 tag）
+      args:
+        BASE_IMAGE: ${MIT_BASE_IMAGE:-docker.m.daocloud.io/pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime}
+    # 等价于 mit-docker.ps1 里原来的：--entrypoint python ... --start-instance --use-gpu
+    entrypoint: ["python"]
+    command: ["server/main.py", "--host", "0.0.0.0", "--port", "8000",
+              "--start-instance", "--use-gpu"]
+    # RTX 50 系（sm_120）要靠 CUDA 12.8 基镜像 + 这里的 GPU 直通
+    gpus: all
+    shm_size: 2g
+    ports:
+      - "${MIT_WEB_PORT:-8010}:8000"
+    volumes:
+      - "${MIT_RUNTIME:-./_runtime}/models:/app/models"        # 模型权重（约 4.8GB）
+      - "${MIT_RUNTIME:-./_runtime}/work/input:/input"         # 可选：批处理输入
+      - "${MIT_RUNTIME:-./_runtime}/work/output:/output"       # 可选：批处理输出
+    # 密钥文件（DEEPSEEK_API_KEY / DEEPSEEK_MODEL …）；文件不存在也不报错
+    env_file:
+      - path: ${MIT_SECRET_ENV:-./secret.env}
+        required: false
+    environment:
+      HF_HOME: /app/models/hf
+      # 国内必配：HF 走镜像；HF_URL_MIRROR 管代码里硬编码的直链（utils/generic.py）
+      HF_ENDPOINT: ${MIT_HF_ENDPOINT:-https://hf-mirror.com}
+      HF_URL_MIRROR: ${MIT_HF_ENDPOINT:-https://hf-mirror.com}
+      # 关掉 HF 的 xet 桥（cas-bridge.xethub.hf.co），国内常 SSL EOF 导致权重下不全
+      HF_HUB_DISABLE_XET: "1"
+      # 跨页上下文：翻译每页时带上前一页作参考（0 = 关闭）
+      MIT_CONTEXT_SIZE: "${MIT_CONTEXT_SIZE:-1}"
+      HTTP_PROXY: ${MIT_PROXY_URL:-http://host.docker.internal:7897}
+      HTTPS_PROXY: ${MIT_PROXY_URL:-http://host.docker.internal:7897}
+      NO_PROXY: "localhost,127.0.0.1,api.deepseek.com,sakura"
+      PYTHONUNBUFFERED: "1"
+    # 代理地址里的 host.docker.internal 在 Linux 宿主机上要靠这条才有
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      # 只证明 HTTP 网关起来了（模型是懒加载，首次翻译时才占显存）
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/queue-size', data=b'', timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+    restart: unless-stopped
+
+  # ---------- MySQL ----------
+  app-db:
+    image: mysql:latest
+    container_name: mit-app-db
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
+    environment:
+      MYSQL_ROOT_PASSWORD: "${MIT_DB_ROOT_PASSWORD:-Alexmercer2000@}"
+      MYSQL_DATABASE: "${MIT_DB_NAME:-mit}"
+      MYSQL_USER: "${MIT_DB_USER:-mit}"
+      MYSQL_PASSWORD: "${MIT_DB_PASSWORD:-Alexmercer2000@}"
+    ports:
+      - "127.0.0.1:${MIT_DB_HOST_PORT:-33063}:3306"     # 避开你已有的 33062
+    volumes:
+      - "${MIT_RUNTIME:-./_runtime}/data/mysql:/var/lib/mysql"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+    restart: unless-stopped
+
+  # ---------- Redis（缓存计数 / 后续任务队列） ----------
+  app-redis:
+    image: redis:latest
+    container_name: mit-app-redis
+    command: ["redis-server", "--requirepass", "${MIT_REDIS_PASSWORD:-Alexmercer2000@}", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:${MIT_REDIS_HOST_PORT:-56379}:6379"  # 避开你已有的 6379
+    volumes:
+      - "${MIT_RUNTIME:-./_runtime}/data/redis:/data"
+    restart: unless-stopped
+
+  # ---------- App 接口服务 ----------
+  app-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    image: mit-app-api:local
+    container_name: mit-app-api
+    depends_on:
+      app-db:
+        condition: service_healthy
+      app-redis:
+        condition: service_started
+      # 只等"引擎容器起来了"；引擎没 GPU/模型坏掉时由 /v1/health 如实报告，
+      # 不用 service_healthy 是为了避免引擎异常时 App 接口直接被拖住不起
+      engine:
+        condition: service_started
+    ports:
+      - "${MIT_APP_PORT:-8020}:8000"
+    volumes:
+      - "${MIT_RUNTIME:-./_runtime}/data/app:/data"
+    environment:
+      # 同一个 compose 网络里，直接用服务名；要指回宿主端口就设 MIT_ENGINE_URL
+      MIT_ENGINE_URL: ${MIT_ENGINE_URL:-http://engine:8000}
+      MIT_DB_HOST: app-db
+      MIT_DB_PORT: "3306"
+      MIT_DB_USER: ${MIT_DB_USER:-mit}
+      MIT_DB_PASSWORD: "${MIT_DB_PASSWORD:-Alexmercer2000@}"
+      MIT_DB_NAME: ${MIT_DB_NAME:-mit}
+      MIT_REDIS_URL: redis://app-redis:6379/0
+      MIT_REDIS_PASSWORD: "${MIT_REDIS_PASSWORD:-Alexmercer2000@}"
+      MIT_DATA_DIR: /data
+      MIT_API_TOKEN: ${MIT_API_TOKEN:-}
+      MIT_CONTEXT_PAGES: ${MIT_CONTEXT_PAGES:-1}
+      MIT_TRANSLATOR: ${MIT_TRANSLATOR:-deepseek}
+      MIT_TARGET_LANG: ${MIT_TARGET_LANG:-CHS}
+      MIT_ENGINE_TIMEOUT: ${MIT_ENGINE_TIMEOUT:-900}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

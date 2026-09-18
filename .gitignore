@@ -51,3 +51,15 @@ MANIFEST
 # SSL Used for running server locally
 cert.pem
 key.pem
+
+# mit-app-api 账号密码
+app.env
+
+# 引擎密钥（DEEPSEEK_API_KEY 等）
+secret.env
+
+# 运行期数据：模型权重(约4.8GB)/MySQL/Redis/缓存/书页 —— 都在项目内，但不入库
+/_runtime/
+
+# epub 抽页 + 接口测试产物
+/epub_test/

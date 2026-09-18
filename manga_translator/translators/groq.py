@@ -4,8 +4,9 @@ from typing import List
 
 from .common import CommonTranslator, MissingAPIKeyException
 from .keys import GROQ_API_KEY, GROQ_MODEL
+from .glossary_mixin import GlossaryMixin
 
-class GroqTranslator(CommonTranslator):
+class GroqTranslator(GlossaryMixin, CommonTranslator):
     _LANGUAGE_CODE_MAP = {
         'CHS': 'Simplified Chinese', 'CHT': 'Traditional Chinese', 'CSY': 'Czech',
         'NLD': 'Dutch', 'ENG': 'English', 'FRA': 'French', 'DEU': 'German',
@@ -48,6 +49,8 @@ class GroqTranslator(CommonTranslator):
 
     def __init__(self, check_groq_key=True):
         super().__init__()
+        # 术语表（glossary_mixin）：Groq 没有 ConfigGPT，模板走 mixin 的内置兜底
+        self.init_glossary()
         self.client = groq.AsyncGroq(api_key=GROQ_API_KEY)
         if not self.client.api_key and check_groq_key:
             raise MissingAPIKeyException('Please set the GROQ_API_KEY environment variable before using the Groq translator.')
@@ -121,7 +124,14 @@ class GroqTranslator(CommonTranslator):
 
         # Prepare the system message
         sanity = [{'role': 'system', 'content': self.chat_system_template.replace('{to_lang}', to_lang)}]
-        
+
+        # 术语表 + 跨页上下文：上游只在 chatgpt.py 里接了这套，这里补齐。见 glossary_mixin.py
+        has_glossary, glossary_msg = self.build_glossary_message(prompt)
+        if has_glossary:
+            sanity.append({'role': 'system', 'content': glossary_msg})
+        if getattr(self, 'prev_context', None):
+            sanity.append({'role': 'system', 'content': self.prev_context})
+
         # Make the API call
         response = await self.client.chat.completions.create(
             model=self.model,

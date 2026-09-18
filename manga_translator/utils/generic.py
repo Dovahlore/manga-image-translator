@@ -145,7 +145,21 @@ def get_filename_from_url(url: str, default: str = '') -> str:
         return m.group(1)
     return default
 
+HF_URL_MIRROR = os.environ.get('HF_URL_MIRROR', '').rstrip('/')
+
+def _apply_hf_mirror(url: str) -> str:
+    """把硬编码的 huggingface.co 直链改写成镜像地址。
+
+    原因：各模型的 _MODEL_MAPPING['url'] 写死了 https://huggingface.co/...，
+    不经过 HF_ENDPOINT，国内直连会 SSL EOF（拿不到 lama_large_512px.ckpt 等）。
+    设置 HF_URL_MIRROR=https://hf-mirror.com 即可全部改写；留空则原样返回。
+    """
+    if HF_URL_MIRROR and url.startswith(('https://huggingface.co/', 'http://huggingface.co/')):
+        return HF_URL_MIRROR + url[url.index('huggingface.co') + len('huggingface.co'):]
+    return url
+
 def download_url_with_progressbar(url: str, path: str):
+    url = _apply_hf_mirror(url)
     if os.path.basename(path) in ('.', '') or os.path.isdir(path):
         new_filename = get_filename_from_url(url)
         if not new_filename:

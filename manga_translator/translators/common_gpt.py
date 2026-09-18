@@ -6,11 +6,12 @@ import time
 
 from .config_gpt import ConfigGPT, TextValue, TranslationList
 from .common import CommonTranslator, VALID_LANGUAGES
+from .glossary_mixin import GlossaryMixin
 from typing import List, Dict
 
 
 
-class CommonGPTTranslator(ConfigGPT, CommonTranslator):
+class CommonGPTTranslator(GlossaryMixin, ConfigGPT, CommonTranslator):
     """
     A base class for GPT-based translators, providing common functionality
     such as prompt assembly and response parsing.
@@ -45,6 +46,11 @@ class CommonGPTTranslator(ConfigGPT, CommonTranslator):
 
         ConfigGPT.__init__(self, config_key=config_key)
         CommonTranslator.__init__(self)
+
+        # 术语表：上游只在 chatgpt.py 里接了这套（load_glossary / 相关术语筛选 / 注入），
+        # deepseek、gemini、groq、custom_openai 这些子类以前设了也静默无效。这里统一接上。
+        # 路径优先级：GPT_GLOSSARY_PATH -> OPENAI_GLOSSARY_PATH -> ./dict/mit_glossary.txt
+        self.init_glossary()
         
         # `_MAX_TOKENS` indicates the maximum output tokens.
         #   Unless specified otherwise: 
@@ -224,8 +230,25 @@ class CommonGPTTranslator(ConfigGPT, CommonTranslator):
                 
                 yield prompt.lstrip(), len(this_batch)
     
+    # 跨页上下文（前几页的原文/译文），由 manga_translator._dispatch_with_context 注入。
+    # 上游只给 chatgpt / chatgpt_2stage 接了这段逻辑，这里补上，
+    # 让 deepseek / gemini / groq / custom_openai 等 CommonGPTTranslator 子类也能吃上下文。
+    prev_context: str = ""
+
+    def set_prev_context(self, text: str = ""):
+        self.prev_context = text or ""
+
     def _assemble_request(self, to_lang: str, prompt: str) -> Dict:
         messages = [{'role': 'system', 'content': self.chat_system_template.format(to_lang=to_lang)}]
+
+        # 术语表：只挑与本批文本相关的条目（上游只在 chatgpt 里接了这套）
+        has_glossary, glossary_msg = self.build_glossary_message(prompt)
+        if has_glossary:
+            messages.append({'role': 'system', 'content': glossary_msg})
+
+        # 上下文作为额外的 system 消息，插在 few-shot 示例之前
+        if self.prev_context:
+            messages.append({'role': 'system', 'content': self.prev_context})
 
         if to_lang in self.chat_sample:
             messages.append({'role': 'user', 'content': self.chat_sample[to_lang][0]})

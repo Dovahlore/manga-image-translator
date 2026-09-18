@@ -462,7 +462,10 @@ class SakuraTranslator(CommonTranslator):
 
         # 发送翻译请求
         response = await self._handle_translation_request(queries)
-        self.logger.debug('-- Sakura Response --\n' + response + '\n\n')
+        # 注意：失败时 response 可能是 list/None，直接与 str 相加会抛
+        # TypeError: can only concatenate str (not "list") to str，
+        # 从而把真正的错误（如 "Connection error."）盖掉，这里统一转成字符串。
+        self.logger.debug('-- Sakura Response --\n' + str(response) + '\n\n')
 
         # 检查翻译结果是否存在重复或行数不匹配的问题
         translations = await self._check_translation_quality(queries, response)

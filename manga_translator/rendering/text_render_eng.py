@@ -12,6 +12,68 @@ BLACK = (0, 0, 0)
 PUNSET_RIGHT_ENG = {'.', '?', '!', ':', ';', ')', '}', "\""}
 
 
+# ---------------------------------------------------------------- CJK 支持
+# 原来的 seg_eng 是给英文写的：upper() + 按空格/标点切词，还要把过短的词左右合并。
+# 中日韩文本没有空格，整句会被当成"一个单词" → 不换行，字号又被 downscale_constraint
+# 卡住，渲出来就是一条横穿气泡的长字串。这里补一条按字断行的分支：
+# 汉字/假名各成 token，连着的拉丁字母数字算一个词，行首禁则的闭合标点并入上一个 token。
+
+def _is_cjk(ch: str) -> bool:
+    o = ord(ch)
+    return (0x3040 <= o <= 0x30FF        # 平假名 / 片假名
+            or 0x3400 <= o <= 0x4DBF     # 扩展 A
+            or 0x4E00 <= o <= 0x9FFF     # 汉字
+            or 0xF900 <= o <= 0xFAFF     # 兼容汉字
+            or 0xFF66 <= o <= 0xFF9F     # 半角片假名
+            or 0x3000 <= o <= 0x303F)    # 全角标点 / 记号
+
+_CJK_NO_LINE_START = set('、。，．：；！？）］｝」』】〉》”’ー～…・,.;:!?)]}')
+_CJK_NO_LINE_END = set('（［｛「『【〈《“‘([{')
+
+
+def _seg_cjk(text: str) -> List[str]:
+    """按字断行：汉字/假名各成 token，拉丁字母数字连成一个词。"""
+    tokens: List[str] = []
+    buf = ''
+    for ch in text:
+        if ch.isspace():
+            if buf:
+                tokens.append(buf)
+                buf = ''
+            continue
+        if not _is_cjk(ch):
+            buf += ch                                # 拉丁/数字连着算一个词
+            continue
+        if ch in _CJK_NO_LINE_END:                    # 开括号：留给下一个字
+            if buf:
+                tokens.append(buf)
+            buf = ch
+            continue
+        if buf in _CJK_NO_LINE_END:                   # 「 + 字 合成一个 token
+            buf = buf + ch
+            tokens.append(buf)
+            buf = ''
+            continue
+        if buf:
+            tokens.append(buf)
+            buf = ''
+        if ch in _CJK_NO_LINE_START and tokens:       # 闭合标点跟着前一个字，别跑行首
+            tokens[-1] += ch
+        else:
+            tokens.append(ch)
+    if buf:
+        tokens.append(buf)
+    return tokens
+
+
+def _cjk_dominant(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    n_cjk = sum(1 for c in stripped if _is_cjk(c))
+    return n_cjk >= 2 and n_cjk >= len(stripped) * 0.3
+
+
 class Textline:
     def __init__(self, text: str = '', pos_x: int = 0, pos_y: int = 0, length: float = 0, spacing: int = 0) -> None:
         self.text = text
@@ -98,6 +160,10 @@ def seg_eng(text: str) -> List[str]:
     Extracts every word from text parameter
     """
     # TODO: replace with regexes
+
+    if _cjk_dominant(text):
+        # 中日韩：按字断行（英文那套切词 + upper() 对中文完全不适配）
+        return _seg_cjk(text.strip())
 
     text = text.strip().upper().replace('  ', ' ').replace(' .', '.').replace('\n', ' ')
     processed_text = ''

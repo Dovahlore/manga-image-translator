@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+pymysql
+cryptography
+redis
+httpx
+python-multipart

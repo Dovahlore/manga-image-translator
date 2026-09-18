@@ -89,75 +89,92 @@ def resize_regions_to_font_size(img: np.ndarray, text_regions: List['TextBlock']
         # Single-axis text box expansion
         single_axis_expanded = False
         dst_points = None
-        
-        if region.horizontal: 
-            used_rows = len(region.texts)
-            # logger.debug(f"Horizontal text - used rows: {used_rows}")
-            
+
+        # ---- 先缩字，再撑框 ----
+        # 原逻辑只"撑框不缩字"：译文比原文长时把框沿单轴拉大，文字会溢出原框、
+        # 盖住相邻气泡、甚至越出页面（第 59 页那种竖排多格页最明显）。
+        # 这里改成：先按"框能装几行/几列"把字号缩到装得下（下限 font_size_minimum），
+        # 缩到底仍放不下才回到原来的撑框逻辑。
+        if target_font_size > font_size_minimum:
+            fs = target_font_size
+            while fs > font_size_minimum:
+                if region.horizontal:
+                    lines, _ = text_render.calc_horizontal(
+                        fs, region.translation,
+                        max_width=region.unrotated_size[0],
+                        max_height=region.unrotated_size[1],
+                        language=getattr(region, "target_lang", "en_US"),
+                    )
+                    avail = max(1, int(region.unrotated_size[1] // fs))
+                    if len(lines) <= avail:
+                        break
+                else:
+                    cols, _ = text_render.calc_vertical(fs, region.translation,
+                                                        max_height=region.unrotated_size[1])
+                    avail = max(1, int(region.unrotated_size[0] // fs))
+                    if len(cols) <= avail:
+                        break
+                fs -= 1
+            target_font_size = fs
+
+        if region.horizontal:
             line_text_list, _ = text_render.calc_horizontal(
-                region.font_size,
+                target_font_size,
                 region.translation,
                 max_width=region.unrotated_size[0],
                 max_height=region.unrotated_size[1],
-                language=getattr(region, "target_lang", "en_US")
+                language=getattr(region, "target_lang", "en_US"),
             )
             needed_rows = len(line_text_list)
-            # logger.debug(f"Needed rows: {needed_rows}")                
+            avail_rows = max(1, int(region.unrotated_size[1] // target_font_size))
 
-            if needed_rows > used_rows:
-                scale_x = ((needed_rows - used_rows) / used_rows) * 1 + 1
-                try:  
+            if needed_rows > avail_rows:
+                scale_x = ((needed_rows - avail_rows) / avail_rows) * 1 + 1
+                try:
                     poly = Polygon(region.unrotated_min_rect[0])
                     minx, miny, maxx, maxy = poly.bounds
-                    poly = affinity.scale(poly, xfact=scale_x, yfact=1.0, origin=(minx, miny))        
-                
-                    pts = np.array(poly.exterior.coords[:4])  
-                    dst_points = rotate_polygons(  
-                        region.center, pts.reshape(1, -1), -region.angle,  
-                        to_int=False  
-                    ).reshape(-1, 4, 2)  
-                    # 移除边界限制，允许文本超出检测框边界
-                    # dst_points[..., 0] = dst_points[..., 0].clip(0, img.shape[1] - 1)  
-                    # dst_points[..., 1] = dst_points[..., 1].clip(0, img.shape[0] - 1)  
+                    poly = affinity.scale(poly, xfact=scale_x, yfact=1.0, origin=(minx, miny))
+
+                    pts = np.array(poly.exterior.coords[:4])
+                    dst_points = rotate_polygons(
+                        region.center, pts.reshape(1, -1), -region.angle,
+                        to_int=False
+                    ).reshape(-1, 4, 2)
+                    # 允许超出原检测框，但不允许越出图片边界
+                    dst_points[..., 0] = dst_points[..., 0].clip(0, img.shape[1] - 1)
+                    dst_points[..., 1] = dst_points[..., 1].clip(0, img.shape[0] - 1)
                     dst_points = dst_points.astype(np.int64)
                     single_axis_expanded = True
-                    # logger.debug(f"Successfully expanded horizontal text width: xfact={scale_x:.2f}")  
-                except Exception as e:  
-                    # logger.error(f"Failed to expand horizontal text: {e}")  
+                except Exception as e:
                     pass
-                    
+
         if region.vertical:
-            used_cols = len(region.texts)
-            # logger.debug(f"Vertical text - used columns: {used_cols}")
-            
             line_text_list, _ = text_render.calc_vertical(
-                region.font_size, 
-                region.translation, 
+                target_font_size,
+                region.translation,
                 max_height=region.unrotated_size[1],
             )
             needed_cols = len(line_text_list)
-            # logger.debug(f"Needed columns: {needed_cols}") 
-            if needed_cols > used_cols:
-                scale_x = ((needed_cols - used_cols) / used_cols) * 1 + 1
-                try:  
+            avail_cols = max(1, int(region.unrotated_size[0] // target_font_size))
+            if needed_cols > avail_cols:
+                scale_x = ((needed_cols - avail_cols) / avail_cols) * 1 + 1
+                try:
                     poly = Polygon(region.unrotated_min_rect[0])
                     minx, miny, maxx, maxy = poly.bounds
-                    poly = affinity.scale(poly, xfact=1.0, yfact=scale_x, origin=(minx, miny))                    
-                    
-                    pts = np.array(poly.exterior.coords[:4])  
-                    dst_points = rotate_polygons(  
-                        region.center, pts.reshape(1, -1), -region.angle,  
-                        to_int=False  
-                    ).reshape(-1, 4, 2)  
-                    # 移除边界限制，允许文本超出检测框边界
-                    # dst_points[..., 0] = dst_points[..., 0].clip(0, img.shape[1] - 1)  
-                    # dst_points[..., 1] = dst_points[..., 1].clip(0, img.shape[0] - 1)  
+                    poly = affinity.scale(poly, xfact=1.0, yfact=scale_x, origin=(minx, miny))
+
+                    pts = np.array(poly.exterior.coords[:4])
+                    dst_points = rotate_polygons(
+                        region.center, pts.reshape(1, -1), -region.angle,
+                        to_int=False
+                    ).reshape(-1, 4, 2)
+                    dst_points[..., 0] = dst_points[..., 0].clip(0, img.shape[1] - 1)
+                    dst_points[..., 1] = dst_points[..., 1].clip(0, img.shape[0] - 1)
                     dst_points = dst_points.astype(np.int64)
                     single_axis_expanded = True
-                    # logger.debug(f"Successfully expanded vertical text width: xfact={scale_x:.2f}")  
-                except Exception as e:  
-                    # logger.error(f"Failed to expand vertical text: {e}")  
+                except Exception as e:
                     pass
+
 
         # If single-axis expansion failed, use general scaling
         if not single_axis_expanded:
@@ -213,9 +230,9 @@ def resize_regions_to_font_size(img: np.ndarray, text_regions: List['TextBlock']
                     scaled_unrotated_points = np.array(poly.exterior.coords[:4])  
 
                     dst_points = rotate_polygons(region.center, scaled_unrotated_points.reshape(1, -1), -region.angle, to_int=False).reshape(-1, 4, 2)  
-                    # 移除边界限制，允许文本超出检测框边界
-                    # dst_points[..., 0] = dst_points[..., 0].clip(0, img.shape[1] - 1)  
-                    # dst_points[..., 1] = dst_points[..., 1].clip(0, img.shape[0] - 1)  
+                    # 允许超出原检测框，但不允许越出图片边界
+                    dst_points[..., 0] = dst_points[..., 0].clip(0, img.shape[1] - 1)  
+                    dst_points[..., 1] = dst_points[..., 1].clip(0, img.shape[0] - 1)  
                     dst_points = dst_points.astype(np.int64)  
                     dst_points = dst_points.reshape((-1, 4, 2))  
                     # logger.debug(f"Finished calculating scaled dst_points.")  
