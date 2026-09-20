@@ -273,7 +273,6 @@ private fun ZoomableImage(
     // 单击/双击判定：单击延迟到双击超时后再触发，双击放大
     var tapSeq by remember { mutableIntStateOf(0) }
     var lastTapAt by remember { mutableLongStateOf(0L) }
-    var lastTapPos by remember { mutableStateOf(Offset.Zero) }
     var pendingSingleTap by remember { mutableStateOf(false) }
     val currentOnSingleTap by rememberUpdatedState(onSingleTap)
 
@@ -284,16 +283,14 @@ private fun ZoomableImage(
 
     fun registerTap(pos: Offset) {
         val now = SystemClock.uptimeMillis()
-        val isDouble = lastTapAt != 0L &&
-            now - lastTapAt <= viewConfig.doubleTapTimeoutMillis &&
-            (pos - lastTapPos).getDistance() <= viewConfig.touchSlop
+        // 双击只看时间间隔，不比对两次点击位置（手指有抖动，位置判定太严格会误伤）
+        val isDouble = lastTapAt != 0L && now - lastTapAt <= viewConfig.doubleTapTimeoutMillis
         if (isDouble) {
             lastTapAt = 0L
             pendingSingleTap = false
             toggleZoom()
         } else {
             lastTapAt = now
-            lastTapPos = pos
             pendingSingleTap = true
             tapSeq++
         }
@@ -305,6 +302,7 @@ private fun ZoomableImage(
             delay(viewConfig.doubleTapTimeoutMillis)
             if (pendingSingleTap) {
                 pendingSingleTap = false
+                lastTapAt = 0L   // 单击完成后清掉，避免下一次点击被误判成双击
                 currentOnSingleTap()
             }
         }
