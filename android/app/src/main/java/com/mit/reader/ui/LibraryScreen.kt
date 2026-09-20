@@ -726,12 +726,23 @@ private fun ProgressList(
         return
     }
     val serverMap = serverBooks.associateBy { it.id }
+    // 只显示翻过/正在翻的书，不把没翻过的也铺出来
+    val visibleBooks = books.filter { book ->
+        translatingBookId == book.id ||
+            (serverMap[book.id]?.let { it.donePages + it.failedPages > 0 } == true)
+    }
+    if (visibleBooks.isEmpty()) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Text("还没有翻译过的书", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        return
+    }
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(12.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        listItems(books, key = { it.id }) { book ->
+        listItems(visibleBooks, key = { it.id }) { book ->
             val s = serverMap[book.id]
             val isRunning = translatingBookId == book.id
             val done = if (isRunning) (translatingProgress?.first ?: 0) else (s?.donePages ?: 0)
@@ -739,7 +750,6 @@ private fun ProgressList(
             val total = book.pageCount
             val status = when {
                 isRunning -> "进行中"
-                done + failed == 0 -> "未开始"
                 done >= total && failed == 0 -> "已完成"
                 failed > 0 && done + failed >= total -> "部分失败"
                 else -> "进行中"

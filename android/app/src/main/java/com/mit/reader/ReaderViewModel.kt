@@ -32,13 +32,9 @@ class ReaderViewModel(private val app: Application) : AndroidViewModel(app) {
         private set
     var showOriginal by mutableStateOf(false)
         private set
-    var peekOriginal by mutableStateOf(false)   // 长按「看原图/译文」按钮时的临时切换
-        private set
     var autoMode by mutableStateOf(false)
         private set
 
-    /** 当前真正展示的是不是原图：固定态(showOriginal) xor 长按临时态(peekOriginal)。 */
-    val effectiveShowOriginal: Boolean get() = showOriginal xor peekOriginal
     val pageStates = mutableStateMapOf<Int, PageState>()
 
     private val pages: List<File> get() = book?.pageFiles ?: emptyList()
@@ -49,7 +45,6 @@ class ReaderViewModel(private val app: Application) : AndroidViewModel(app) {
         currentPage = readerApp.library.readingProgress(b.id)?.page
             ?.coerceIn(0, (b.pageCount - 1).coerceAtLeast(0)) ?: 0
         showOriginal = false
-        peekOriginal = false
         pageStates.clear()
         // 本地译文缓存还在的页，直接标记 DONE（旋转/重启后不用重翻，也不用再问服务端）
         for (i in b.pageFiles.indices) {
@@ -65,7 +60,6 @@ class ReaderViewModel(private val app: Application) : AndroidViewModel(app) {
         currentPage = i
         // 翻页后默认展示译文（若该页已翻好），用户点「看原图」才临时切回原文
         showOriginal = false
-        peekOriginal = false
         if (autoMode) prefetchAfter(i)
     }
 
@@ -77,13 +71,6 @@ class ReaderViewModel(private val app: Application) : AndroidViewModel(app) {
     fun toggleOriginal() {
         if (pageStates[currentPage]?.status == PageStatus.DONE) {
             showOriginal = !showOriginal
-        }
-    }
-
-    /** 长按按钮期间的临时切换：on=true 临时显示另一视图，松开后 on=false 恢复。 */
-    fun setPeek(on: Boolean) {
-        if (pageStates[currentPage]?.status == PageStatus.DONE) {
-            peekOriginal = on
         }
     }
 

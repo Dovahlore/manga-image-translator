@@ -18,8 +18,13 @@ object EpubParser {
         ZipFile(epub).use { zip ->
             val opfName = zip.entries().asSequence()
                 .map { it.name }
-                .first { it.lowercase().endsWith(".opf") }
-            val opf = zip.readText(zip.getEntry(opfName))
+                .firstOrNull { it.lowercase().endsWith(".opf") }
+                ?: throw IllegalStateException("不是有效的 EPUB（找不到 OPF 文件）")
+            val opf = try {
+                zip.readText(zip.getEntry(opfName))
+            } catch (e: Exception) {
+                throw IllegalStateException("EPUB 文件损坏或未完整下载（读 OPF 失败）")
+            }
             val opfDir = opfName.substringBeforeLast('/', "")
 
             val (idToHref, spine) = parseOpf(opf)
@@ -29,20 +34,29 @@ object EpubParser {
             var idx = 0
             for (doc in spine) {
                 val docPath = if (opfDir.isEmpty()) doc else "$opfDir/$doc"
-                val text = zip.entryOrNull(docPath)?.let { zip.readText(it) } ?: continue
+                val entry = zip.entryOrNull(docPath) ?: continue
+                val text = try {
+                    zip.readText(entry)
+                } catch (e: Exception) {
+                    continue   // 单个 XHTML 损坏就跳过，不影响其它页
+                }
                 val docDir = doc.substringBeforeLast('/', "")
                 for (href in docImageRefs(text)) {
                     val abs = resolve(docDir, href) ?: continue
-                    val entry = zip.entryOrNull(abs) ?: continue
+                    val imgEntry = zip.entryOrNull(abs) ?: continue
                     val ext = abs.substringAfterLast('.', ".jpg").lowercase()
                         .let { if (it in IMG_EXT) it else ".jpg" }
                     idx++
                     val dest = File(pagesDir, "page-${idx.toString().padStart(3, '0')}.$ext")
-                    zip.getInputStream(entry).use { it.copyTo(dest.outputStream()) }
-                    out += dest
+                    try {
+                        zip.getInputStream(imgEntry).use { it.copyTo(dest.outputStream()) }
+                        out += dest
+                    } catch (e: Exception) {
+                        dest.delete()   // 半截图片删掉
+                    }
                 }
             }
-            if (out.isEmpty()) throw IllegalStateException("这个 EPUB 里没找到图页（可能是纯文字书）")
+            if (out.isEmpty()) throw IllegalStateException("这个 EPUB 里没找到图页（可能是纯文字书或文件损坏）")
             return ParsedBook(title, out)
         }
     }

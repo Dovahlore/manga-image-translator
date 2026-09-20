@@ -2,15 +2,12 @@ package com.mit.reader.ui
 
 import android.os.SystemClock
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.LocalIndication
-import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
-import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -188,8 +185,6 @@ fun ReaderScreen(bookId: String, onBack: () -> Unit) {
                             enabled = status == PageStatus.DONE,
                             showOriginal = vm.showOriginal,
                             onToggle = { vm.toggleOriginal() },
-                            onPeekStart = { vm.setPeek(true) },
-                            onPeekEnd = { vm.setPeek(false) },
                         )
                     }
                 }
@@ -203,8 +198,8 @@ fun ReaderScreen(bookId: String, onBack: () -> Unit) {
                 modifier = Modifier.fillMaxSize(),
             ) { i ->
                 val pageState = vm.pageStates[i]
-                // 该页已翻好时默认展示译文；用户点图/按钮切换原图（含长按临时切换）
-                val show = i == vm.currentPage && pageState?.status == PageStatus.DONE && !vm.effectiveShowOriginal
+                // 该页已翻好时默认展示译文；用户点图/按钮切换原图
+                val show = i == vm.currentPage && pageState?.status == PageStatus.DONE && !vm.showOriginal
                 val file = if (show) pageState?.translatedFile else book.pageFiles[i]
                 ZoomableImage(
                     model = file,
@@ -231,45 +226,20 @@ fun ReaderScreen(bookId: String, onBack: () -> Unit) {
     }
 }
 
-/** 切换译文/原图按钮：短按固定切换，长按临时切到另一视图、松开恢复。 */
-@OptIn(ExperimentalFoundationApi::class)
+/** 切换译文/原图按钮（简单开关）。 */
 @Composable
 private fun ToggleViewButton(
     enabled: Boolean,
     showOriginal: Boolean,
     onToggle: () -> Unit,
-    onPeekStart: () -> Unit,
-    onPeekEnd: () -> Unit,
 ) {
-    val interactionSource = remember { MutableInteractionSource() }
-
     Surface(
         shape = MaterialTheme.shapes.small,
         color = Color.Transparent,
         contentColor = if (enabled) MaterialTheme.colorScheme.primary
         else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
-        modifier = Modifier
-            .combinedClickable(
-                interactionSource = interactionSource,
-                indication = LocalIndication.current,
-                enabled = enabled,
-                onClick = { onToggle() },
-                onLongClick = { onPeekStart() },
-            )
-            .pointerInput(enabled) {
-                if (!enabled) return@pointerInput
-                // combinedClickable 的长按不会发 PressInteraction.Release，
-                // 这里用原始按下/抬起事件可靠地结束 peek
-                awaitEachGesture {
-                    awaitFirstDown(requireUnconsumed = false)
-                    while (true) {
-                        val event = awaitPointerEvent()
-                        if (event.changes.none { it.pressed }) break
-                    }
-                    onPeekEnd()
-                }
-            },
+        modifier = Modifier.clickable(enabled = enabled, onClick = onToggle),
     ) {
         Text(
             text = if (showOriginal) "看译文" else "看原图",
@@ -377,17 +347,22 @@ private fun ZoomableImage(
                             scale.floatValue = newScale
 
                             if (pressed == 1 && newScale > 1f) {
-                                // 放大后的单指平移：滑到水平边缘再继续外滑 → 累计翻页距离
+                                // 放大后的单指平移：水平滑到边缘继续外滑 → 累计翻页距离；垂直始终平移
                                 val maxX = viewport.value.width * (newScale - 1f) / 2f
+                                val maxY = viewport.value.height * (newScale - 1f) / 2f
                                 val panX = panChange.x
+                                val panY = panChange.y
                                 val atLeft = offset.value.x <= -maxX + 0.5f
                                 val atRight = offset.value.x >= maxX - 0.5f
-                                if ((atLeft && panX < 0f) || (atRight && panX > 0f)) {
+                                val newX = if ((atLeft && panX < 0f) || (atRight && panX > 0f)) {
                                     overscrollX += panX
+                                    offset.value.x
                                 } else {
-                                    offset.value = clampOffset(offset.value + panChange, newScale, viewport.value)
                                     overscrollX = 0f
+                                    (offset.value.x + panX).coerceIn(-maxX, maxX)
                                 }
+                                val newY = (offset.value.y + panY).coerceIn(-maxY, maxY)
+                                offset.value = Offset(newX, newY)
                             } else {
                                 offset.value = clampOffset(offset.value + panChange, newScale, viewport.value)
                             }
