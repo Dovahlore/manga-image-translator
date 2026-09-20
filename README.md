@@ -26,9 +26,9 @@
 
 ## 截图
 
-| 书库 | 阅读器 |
-|------|--------|
-| ![](docs/screenshots/library.svg) | ![](docs/screenshots/reader.svg) |
+| 书库 | 原文（日文） | 译文（中文） |
+|------|--------------|--------------|
+| ![书库](docs/screenshots/library.jpg) | ![原文](docs/screenshots/original.jpg) | ![译文](docs/screenshots/translated.jpg) |
 
 ## 架构
 
