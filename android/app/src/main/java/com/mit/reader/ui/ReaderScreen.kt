@@ -11,7 +11,6 @@ import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.interaction.PressInteraction
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -70,7 +69,6 @@ import com.mit.reader.ReaderViewModel
 import com.mit.reader.data.ReadingMode
 import kotlin.math.abs
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 
 private const val MAX_ZOOM = 5f
@@ -245,29 +243,33 @@ private fun ToggleViewButton(
 ) {
     val interactionSource = remember { MutableInteractionSource() }
 
-    LaunchedEffect(interactionSource) {
-        interactionSource.interactions.collect { interaction ->
-            when (interaction) {
-                is PressInteraction.Release -> onPeekEnd()
-                is PressInteraction.Cancel -> onPeekEnd()
-                else -> Unit
-            }
-        }
-    }
-
     Surface(
         shape = MaterialTheme.shapes.small,
         color = Color.Transparent,
         contentColor = if (enabled) MaterialTheme.colorScheme.primary
         else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
-        modifier = Modifier.combinedClickable(
-            interactionSource = interactionSource,
-            indication = LocalIndication.current,
-            enabled = enabled,
-            onClick = { onToggle() },
-            onLongClick = { onPeekStart() },
-        ),
+        modifier = Modifier
+            .combinedClickable(
+                interactionSource = interactionSource,
+                indication = LocalIndication.current,
+                enabled = enabled,
+                onClick = { onToggle() },
+                onLongClick = { onPeekStart() },
+            )
+            .pointerInput(enabled) {
+                if (!enabled) return@pointerInput
+                // combinedClickable 的长按不会发 PressInteraction.Release，
+                // 这里用原始按下/抬起事件可靠地结束 peek
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false)
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        if (event.changes.none { it.pressed }) break
+                    }
+                    onPeekEnd()
+                }
+            },
     ) {
         Text(
             text = if (showOriginal) "看译文" else "看原图",
