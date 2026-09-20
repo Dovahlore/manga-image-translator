@@ -45,8 +45,9 @@ class ReaderViewModel(private val app: Application) : AndroidViewModel(app) {
 
     fun load(b: Book) {
         book = b
-        // 都从封面（第 0 页）开始；日漫是"从右往左"排（ReaderScreen 里 reverseLayout），不是倒着读页码
-        currentPage = 0
+        // 从上次读到的页继续（没有记录就从第 0 页/封面开始）
+        currentPage = readerApp.library.readingProgress(b.id)?.page
+            ?.coerceIn(0, (b.pageCount - 1).coerceAtLeast(0)) ?: 0
         showOriginal = false
         peekOriginal = false
         pageStates.clear()

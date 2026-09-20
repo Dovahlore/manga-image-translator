@@ -13,6 +13,7 @@ class LibraryRepository(private val context: Context) {
     private val root = File(context.filesDir, "library").apply { mkdirs() }
     private val indexFile = File(root, "index.json")
     private val translatedRoot = File(context.filesDir, "translated").apply { mkdirs() }
+    private val progressPrefs = context.getSharedPreferences("reading_progress", Context.MODE_PRIVATE)
 
     private data class IndexData(val books: List<Book>, val folders: List<Folder>)
 
@@ -98,6 +99,32 @@ class LibraryRepository(private val context: Context) {
     suspend fun moveBook(bookId: String, folderId: String?) = withContext(Dispatchers.IO) {
         val d = readIndexData()
         writeIndex(d.books.map { if (it.id == bookId) it.copy(folderId = folderId) else it }, d.folders)
+    }
+
+    // ---------------------------------------------------------------- 阅读进度
+
+    /** 记录某本书读到的页（0-based）。走 SharedPreferences，翻页即存、很快。 */
+    fun setReadingProgress(bookId: String, page: Int) {
+        progressPrefs.edit()
+            .putInt("page_$bookId", page.coerceAtLeast(0))
+            .putLong("time_$bookId", System.currentTimeMillis())
+            .apply()
+    }
+
+    fun readingProgress(bookId: String): ReadingProgress? {
+        val t = progressPrefs.getLong("time_$bookId", 0L)
+        if (t == 0L) return null
+        return ReadingProgress(progressPrefs.getInt("page_$bookId", 0), t)
+    }
+
+    /** 最近读的那本书及其进度（书库页「继续阅读」用）。 */
+    fun lastRead(books: List<Book>): Pair<Book, ReadingProgress>? {
+        var best: Pair<Book, ReadingProgress>? = null
+        for (b in books) {
+            val p = readingProgress(b.id) ?: continue
+            if (best == null || p.lastReadAt > best.second.lastReadAt) best = b to p
+        }
+        return best
     }
 
     /** 某本书某页的译文缓存文件（本地缓存，服务端 14 天会删，这里留着）。 */

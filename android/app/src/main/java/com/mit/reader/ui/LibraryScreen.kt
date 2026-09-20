@@ -1,6 +1,10 @@
 package com.mit.reader.ui
 
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -43,6 +47,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
@@ -68,6 +73,7 @@ import com.mit.reader.ReaderApp
 import com.mit.reader.data.Book
 import com.mit.reader.data.Folder
 import com.mit.reader.data.ReadingMode
+import com.mit.reader.data.ReadingProgress
 import com.mit.reader.data.ServerBook
 import kotlinx.coroutines.launch
 import java.io.File
@@ -75,7 +81,9 @@ import java.io.File
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
-    val app = LocalContext.current.applicationContext as ReaderApp
+    val context = LocalContext.current
+    val app = context.applicationContext as ReaderApp
+    val activity = context.findActivity()
     var books by remember { mutableStateOf<List<Book>>(emptyList()) }
     var folders by remember { mutableStateOf<List<Folder>>(emptyList()) }
     var refreshing by remember { mutableStateOf(0) }
@@ -91,6 +99,8 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
     var renameTarget by remember { mutableStateOf<Folder?>(null) }
     var searchActive by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf("") }
+    var showExitDialog by remember { mutableStateOf(false) }
+    var lastRead by remember { mutableStateOf<Pair<Book, ReadingProgress>?>(null) }
     val scope = rememberCoroutineScope()
 
     fun reload() { refreshing++ }
@@ -107,8 +117,10 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
     }
 
     LaunchedEffect(refreshing) {
-        books = app.library.books()
+        val b = app.library.books()
+        books = b
         folders = app.library.folders()
+        lastRead = app.library.lastRead(b)
     }
 
     // 每次切到「翻译进度」页都拉一次服务端汇总
@@ -117,6 +129,15 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
             runCatching { app.api.listBooks() }
                 .onSuccess { serverBooks = it; progressErr = null }
                 .onFailure { progressErr = it.message }
+        }
+    }
+
+    // 书库页按系统返回：先退搜索/文件夹，否则弹确认退出
+    BackHandler {
+        when {
+            searchActive -> { searchActive = false; searchQuery = "" }
+            currentFolderId != null -> currentFolderId = null
+            else -> showExitDialog = true
         }
     }
 
@@ -181,6 +202,7 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
                         books = books,
                         folders = folders,
                         currentFolderId = currentFolderId,
+                        lastRead = lastRead,
                         onOpen = onOpen,
                         onEnterFolder = { currentFolderId = it },
                         onNewFolder = { showCreateFolder = true },
@@ -284,14 +306,35 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
             onDismiss = { renameTarget = null },
         )
     }
+
+    // ---- 退出确认 ----
+    if (showExitDialog) {
+        AlertDialog(
+            onDismissRequest = { showExitDialog = false },
+            title = { Text("退出应用？") },
+            text = { Text("确定要退出吗？") },
+            confirmButton = {
+                TextButton(onClick = { activity?.finish() }) { Text("退出") }
+            },
+            dismissButton = { TextButton(onClick = { showExitDialog = false }) { Text("取消") } },
+        )
+    }
 }
 
-/** 「书库」页：根视图 = 收藏夹区 + 未分类书；点进收藏夹 = 只看该文件夹里的书。 */
+/** 从 Context 链上找到宿主 Activity（用于退出应用）。 */
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
+
+/** 「书库」页：根视图 = 上次阅读 + 收藏夹区 + 未分类书；点进收藏夹 = 只看该文件夹里的书。 */
 @Composable
 private fun LibraryTab(
     books: List<Book>,
     folders: List<Folder>,
     currentFolderId: String?,
+    lastRead: Pair<Book, ReadingProgress>?,
     onOpen: (String) -> Unit,
     onEnterFolder: (String) -> Unit,
     onNewFolder: () -> Unit,
@@ -352,6 +395,16 @@ private fun LibraryTab(
         verticalArrangement = Arrangement.spacedBy(12.dp),
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        // 上次阅读（整行占满，放在最前面）
+        if (lastRead != null) {
+            item(span = { GridItemSpan(maxLineSpan) }) {
+                ContinueReadingCard(
+                    book = lastRead.first,
+                    page = lastRead.second.page,
+                    onContinue = { onOpen(lastRead.first.id) },
+                )
+            }
+        }
         // 收藏夹区（整行占满）
         item(span = { GridItemSpan(maxLineSpan) }) {
             FoldersSection(
@@ -817,6 +870,34 @@ private fun SearchRow(title: String, subtitle: String?, onClick: () -> Unit) {
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        }
+    }
+}
+
+/** 「继续阅读」卡片：显示上次读的书和进度，点它跳到上次那页。 */
+@Composable
+private fun ContinueReadingCard(book: Book, page: Int, onContinue: () -> Unit) {
+    Surface(
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onContinue),
+    ) {
+        Row(Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            AsyncImage(
+                model = book.coverFile,
+                contentDescription = book.title,
+                contentScale = ContentScale.FillBounds,
+                modifier = Modifier.size(width = 44.dp, height = 60.dp).clip(MaterialTheme.shapes.small),
+            )
+            Column(Modifier.weight(1f).padding(start = 10.dp)) {
+                Text("继续阅读", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                Text(book.title, maxLines = 1, style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    "读到第 ${(page + 1).coerceAtMost(book.pageCount)} / ${book.pageCount} 页",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 }

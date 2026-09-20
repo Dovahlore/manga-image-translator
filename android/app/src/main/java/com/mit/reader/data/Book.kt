@@ -13,6 +13,9 @@ data class Folder(
     val name: String,
 )
 
+/** 阅读进度：上次读到的页（0-based）+ 时间戳。 */
+data class ReadingProgress(val page: Int, val lastReadAt: Long)
+
 data class Book(
     val id: String,
     val title: String,

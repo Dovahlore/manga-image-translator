@@ -93,6 +93,8 @@ fun ReaderScreen(bookId: String, onBack: () -> Unit) {
 
     LaunchedEffect(pagerState.currentPage) {
         vm.setPage(pagerState.currentPage)
+        // 记录阅读进度（下次打开跳到这一页）
+        app.library.setReadingProgress(book.id, pagerState.currentPage)
     }
 
     val st = vm.pageStates[vm.currentPage]
