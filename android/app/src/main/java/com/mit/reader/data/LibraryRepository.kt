@@ -14,9 +14,13 @@ class LibraryRepository(private val context: Context) {
     private val indexFile = File(root, "index.json")
     private val translatedRoot = File(context.filesDir, "translated").apply { mkdirs() }
 
-    suspend fun books(): List<Book> = withContext(Dispatchers.IO) { readIndex() }
+    private data class IndexData(val books: List<Book>, val folders: List<Folder>)
 
-    suspend fun book(id: String): Book? = withContext(Dispatchers.IO) { readIndex().find { it.id == id } }
+    suspend fun books(): List<Book> = withContext(Dispatchers.IO) { readIndexData().books }
+
+    suspend fun folders(): List<Folder> = withContext(Dispatchers.IO) { readIndexData().folders }
+
+    suspend fun book(id: String): Book? = withContext(Dispatchers.IO) { readIndexData().books.find { it.id == id } }
 
     suspend fun import(uri: Uri): Book = withContext(Dispatchers.IO) {
         val id = UUID.randomUUID().toString()
@@ -30,8 +34,8 @@ class LibraryRepository(private val context: Context) {
             else -> EpubParser.extract(src, dir)
         }
         val book = Book(id, r.title, ReadingMode.MANGA, r.pages.size, r.pages.first(), r.pages)
-        val all = readIndex().toMutableList().apply { add(book) }
-        writeIndex(all)
+        val d = readIndexData()
+        writeIndex(d.books + book, d.folders)
         book
     }
 
@@ -59,12 +63,41 @@ class LibraryRepository(private val context: Context) {
     suspend fun delete(id: String) = withContext(Dispatchers.IO) {
         File(root, id).deleteRecursively()
         File(translatedRoot, id).deleteRecursively()
-        writeIndex(readIndex().filterNot { it.id == id })
+        val d = readIndexData()
+        writeIndex(d.books.filterNot { it.id == id }, d.folders)
     }
 
     suspend fun setMode(id: String, mode: ReadingMode) = withContext(Dispatchers.IO) {
-        val all = readIndex().map { if (it.id == id) it.copy(mode = mode) else it }
-        writeIndex(all)
+        val d = readIndexData()
+        writeIndex(d.books.map { if (it.id == id) it.copy(mode = mode) else it }, d.folders)
+    }
+
+    // ---------------------------------------------------------------- 收藏夹
+
+    suspend fun createFolder(name: String): Folder = withContext(Dispatchers.IO) {
+        val d = readIndexData()
+        val f = Folder(UUID.randomUUID().toString(), name.trim().ifBlank { "未命名" })
+        writeIndex(d.books, d.folders + f)
+        f
+    }
+
+    suspend fun renameFolder(id: String, name: String) = withContext(Dispatchers.IO) {
+        val d = readIndexData()
+        writeIndex(d.books, d.folders.map { if (it.id == id) it.copy(name = name.trim()) else it })
+    }
+
+    suspend fun deleteFolder(id: String) = withContext(Dispatchers.IO) {
+        val d = readIndexData()
+        writeIndex(
+            d.books.map { if (it.folderId == id) it.copy(folderId = null) else it },
+            d.folders.filterNot { it.id == id },
+        )
+    }
+
+    /** 把书移进/移出收藏夹。folderId 传 null 表示移到「未分类」。 */
+    suspend fun moveBook(bookId: String, folderId: String?) = withContext(Dispatchers.IO) {
+        val d = readIndexData()
+        writeIndex(d.books.map { if (it.id == bookId) it.copy(folderId = folderId) else it }, d.folders)
     }
 
     /** 某本书某页的译文缓存文件（本地缓存，服务端 14 天会删，这里留着）。 */
@@ -75,9 +108,23 @@ class LibraryRepository(private val context: Context) {
 
     // ---------------------------------------------------------------- index 持久化
 
-    private fun readIndex(): List<Book> {
-        if (!indexFile.exists()) return emptyList()
-        val arr = runCatching { JSONArray(indexFile.readText()) }.getOrNull() ?: return emptyList()
+    private fun readIndexData(): IndexData {
+        if (!indexFile.exists()) return IndexData(emptyList(), emptyList())
+        val text = indexFile.readText()
+        // 老版本是纯数组（只有 books），迁移成新格式
+        runCatching { JSONArray(text) }.getOrNull()?.let { return IndexData(parseBooks(it), emptyList()) }
+        val obj = runCatching { JSONObject(text) }.getOrNull() ?: return IndexData(emptyList(), emptyList())
+        val books = obj.optJSONArray("books")?.let { parseBooks(it) } ?: emptyList()
+        val folders = obj.optJSONArray("folders")?.let { fa ->
+            (0 until fa.length()).map { i ->
+                val o = fa.getJSONObject(i)
+                Folder(o.getString("id"), o.optString("name", "未命名"))
+            }
+        } ?: emptyList()
+        return IndexData(books, folders)
+    }
+
+    private fun parseBooks(arr: JSONArray): List<Book> {
         val out = mutableListOf<Book>()
         for (i in 0 until arr.length()) {
             val o = arr.getJSONObject(i)
@@ -92,20 +139,29 @@ class LibraryRepository(private val context: Context) {
                 pageCount = pages.size,
                 coverFile = pages.first(),
                 pageFiles = pages,
+                folderId = if (o.isNull("folder_id")) null else o.optString("folder_id").takeIf { it.isNotBlank() },
             )
         }
         return out
     }
 
-    private fun writeIndex(books: List<Book>) {
-        val arr = JSONArray()
+    private fun writeIndex(books: List<Book>, folders: List<Folder>) {
+        val obj = JSONObject()
+        val barr = JSONArray()
         books.forEach { b ->
-            arr.put(JSONObject().apply {
+            barr.put(JSONObject().apply {
                 put("id", b.id)
                 put("title", b.title)
                 put("mode", if (b.mode == ReadingMode.NORMAL) "normal" else "manga")
+                b.folderId?.let { put("folder_id", it) }
             })
         }
-        indexFile.writeText(arr.toString())
+        obj.put("books", barr)
+        val farr = JSONArray()
+        folders.forEach { f ->
+            farr.put(JSONObject().apply { put("id", f.id); put("name", f.name) })
+        }
+        obj.put("folders", farr)
+        indexFile.writeText(obj.toString())
     }
 }
