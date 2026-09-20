@@ -2,6 +2,7 @@ package com.mit.reader.data
 
 import android.content.Context
 import android.net.Uri
+import android.provider.OpenableColumns
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -27,6 +28,9 @@ class LibraryRepository(private val context: Context) {
         val id = UUID.randomUUID().toString()
         val dir = File(root, id).apply { mkdirs() }
         val src = File(dir, "book.src")
+        // 书名优先用「文件名」——那才是用户在文件管理器里认得的名字；
+        // 书内部元数据的标题常常和文件名对不上（比如 [Kmoe][尼古喵喵]卷01 内部叫「雅尼貓 - 卷01」）
+        val fromName = titleFromFileName(displayNameOf(uri))
         context.contentResolver.openInputStream(uri)?.use { it.copyTo(src.outputStream()) }
             ?: throw IllegalStateException("无法读取所选文件")
 
@@ -34,10 +38,25 @@ class LibraryRepository(private val context: Context) {
             "mobi" -> MobiParser.extract(src, dir)
             else -> EpubParser.extract(src, dir)
         }
-        val book = Book(id, r.title, ReadingMode.MANGA, r.pages.size, r.pages.first(), r.pages)
+        val book = Book(id, fromName.ifBlank { r.title }, ReadingMode.MANGA, r.pages.size, r.pages.first(), r.pages)
         val d = readIndexData()
         writeIndex(d.books + book, d.folders)
         book
+    }
+
+    /** 取 ContentResolver 里的原始文件名（例：[Kmoe][尼古喵喵]卷01.epub）。 */
+    private fun displayNameOf(uri: Uri): String? = runCatching {
+        context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+    }.getOrNull()
+
+    /** 文件名 → 书名：去扩展名、去掉开头的 [来源] 标签，其余方括号换成空格。 */
+    private fun titleFromFileName(name: String?): String {
+        if (name.isNullOrBlank()) return ""
+        var s = name.substringBeforeLast('.')
+        s = s.replace(Regex("""^\[[^\]]*]\s*"""), "")   // 去掉 [Kmoe] 这类开头的来源标签
+        s = s.replace('[', ' ').replace(']', ' ')
+        return s.replace(Regex("""\s+"""), " ").trim()
     }
 
     /** 按文件头嗅探格式：MOBI 的 PDB 头 60..68 字节是 "BOOK"+"MOBI"，EPUB 是 "PK\x03\x04"。 */
@@ -99,6 +118,14 @@ class LibraryRepository(private val context: Context) {
     suspend fun moveBook(bookId: String, folderId: String?) = withContext(Dispatchers.IO) {
         val d = readIndexData()
         writeIndex(d.books.map { if (it.id == bookId) it.copy(folderId = folderId) else it }, d.folders)
+    }
+
+    /** 重命名书名（空白则忽略）。 */
+    suspend fun renameBook(bookId: String, title: String) = withContext(Dispatchers.IO) {
+        val t = title.trim()
+        if (t.isBlank()) return@withContext
+        val d = readIndexData()
+        writeIndex(d.books.map { if (it.id == bookId) it.copy(title = t) else it }, d.folders)
     }
 
     // ---------------------------------------------------------------- 阅读进度

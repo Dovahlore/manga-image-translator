@@ -97,6 +97,7 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
     var confirmDeleteFolder by remember { mutableStateOf<Folder?>(null) }
     var folderMenuTarget by remember { mutableStateOf<Folder?>(null) }
     var renameTarget by remember { mutableStateOf<Folder?>(null) }
+    var renameBookTarget by remember { mutableStateOf<Book?>(null) }
     var searchActive by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf("") }
     var showExitDialog by remember { mutableStateOf(false) }
@@ -220,6 +221,7 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
                             scope.launch { app.library.moveBook(book.id, null); reload() }
                         },
                         onDelete = { confirmDelete = it },
+                        onRenameBook = { renameBookTarget = it },
                         onFolderMenu = { folderMenuTarget = it },
                         onTranslateAll = { app.startTranslateAll(it) },
                         translatingBookId = app.translatingBookId,
@@ -313,6 +315,15 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
         )
     }
 
+    // ---- 重命名书 ----
+    renameBookTarget?.let { book ->
+        RenameBookDialog(
+            book = book,
+            onRename = { name -> scope.launch { app.library.renameBook(book.id, name); reload() }; renameBookTarget = null },
+            onDismiss = { renameBookTarget = null },
+        )
+    }
+
     // ---- 退出确认 ----
     if (showExitDialog) {
         AlertDialog(
@@ -348,6 +359,7 @@ private fun LibraryTab(
     onMoveToFolder: (Book, String) -> Unit,
     onMoveOut: (Book) -> Unit,
     onDelete: (Book) -> Unit,
+    onRenameBook: (Book) -> Unit,
     onFolderMenu: (Folder) -> Unit,
     onTranslateAll: (Book) -> Unit,
     translatingBookId: String?,
@@ -376,6 +388,7 @@ private fun LibraryTab(
             onMoveBook = onMoveBook,
             onMoveOut = onMoveOut,
             onDelete = onDelete,
+            onRenameBook = onRenameBook,
             onTranslateAll = onTranslateAll,
             translatingBookId = translatingBookId,
             translatingProgress = translatingProgress,
@@ -432,6 +445,7 @@ private fun LibraryTab(
                     onTranslateAll = { onTranslateAll(book) },
                     onMove = { onMoveBook(book) },
                     onDelete = { onDelete(book) },
+                    onRename = { onRenameBook(book) },
                     isTranslating = translatingBookId == book.id,
                     progressText = if (translatingBookId == book.id) translatingProgress?.let { "${it.first}/${it.second}" } else null,
                 )
@@ -457,6 +471,7 @@ private fun BookGrid(
     onMoveBook: (Book) -> Unit,
     onMoveOut: (Book) -> Unit,
     onDelete: (Book) -> Unit,
+    onRenameBook: (Book) -> Unit,
     onTranslateAll: (Book) -> Unit,
     translatingBookId: String?,
     translatingProgress: Pair<Int, Int>?,
@@ -478,6 +493,7 @@ private fun BookGrid(
                 onMove = { onMoveBook(book) },
                 onMoveOut = { onMoveOut(book) },
                 onDelete = { onDelete(book) },
+                onRename = { onRenameBook(book) },
                 isTranslating = translatingBookId == book.id,
                 progressText = if (translatingBookId == book.id) translatingProgress?.let { "${it.first}/${it.second}" } else null,
             )
@@ -557,6 +573,7 @@ private fun BookCell(
     onMove: () -> Unit,
     onMoveOut: () -> Unit = {},
     onDelete: () -> Unit,
+    onRename: () -> Unit = {},
     isTranslating: Boolean,
     progressText: String?,
 ) {
@@ -593,6 +610,7 @@ private fun BookCell(
                     } else {
                         DropdownMenuItem(text = { Text("移动到文件夹…") }, onClick = { menuOpen = false; onMove() })
                     }
+                    DropdownMenuItem(text = { Text("重命名") }, onClick = { menuOpen = false; onRename() })
                     DropdownMenuItem(text = { Text("删除") }, onClick = { menuOpen = false; onDelete() })
                 }
             }
@@ -712,6 +730,32 @@ private fun RenameFolderDialog(
                 value = name,
                 onValueChange = { name = it },
                 label = { Text("名称") },
+                singleLine = true,
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = { onRename(name) }) { Text("确定") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
+}
+
+/** 重命名书（导入时用的是文件名，可在这里改成自己喜欢的名字）。 */
+@Composable
+private fun RenameBookDialog(
+    book: Book,
+    onRename: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var name by remember { mutableStateOf(book.title) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("重命名书") },
+        text = {
+            OutlinedTextField(
+                value = name,
+                onValueChange = { name = it },
+                label = { Text("书名") },
                 singleLine = true,
             )
         },
