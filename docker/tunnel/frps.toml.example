@@ -1,0 +1,14 @@
+# frps 配置 —— 跑在你的 **VPS** 上
+# 用法：./frps -c frps.toml   或   docker 跑 snowdreamtech/frps 挂载此文件
+
+bindPort = 7000
+
+# 鉴权：与本地 frpc.toml 里的一致，改成随机串
+auth.method = "token"
+auth.token = "CHANGE_ME_RANDOM_TOKEN"
+
+# 可选：管理面板（默认不开）
+# webServer.addr = "127.0.0.1"
+# webServer.port = 7500
+# webServer.user = "admin"
+# webServer.password = "admin"

@@ -127,9 +127,9 @@ class LibraryRepository(private val context: Context) {
         return best
     }
 
-    /** 某本书某页的译文缓存文件（本地缓存，服务端 14 天会删，这里留着）。 */
+    /** 某本书某页的译文缓存文件（本地缓存，服务端 14 天会删，这里留着）。服务端现发 WebP 无损。 */
     fun translatedCacheFile(bookId: String, pageIndex: Int): File =
-        File(File(translatedRoot, bookId), pageIndex.toString().padStart(3, '0') + ".png")
+        File(File(translatedRoot, bookId), pageIndex.toString().padStart(3, '0') + ".webp")
 
     fun epubFile(bookId: String): File = File(File(root, bookId), "book.src")
 

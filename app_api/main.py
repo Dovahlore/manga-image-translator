@@ -11,6 +11,7 @@ import asyncio
 import base64
 import copy
 import hashlib
+import io
 import json
 import shutil
 import time
@@ -322,9 +323,32 @@ def normalize_blocks(result: dict, target_lang: str = "CHS", include_background:
     return blocks
 
 
+def _to_webp_lossless(data: bytes) -> bytes:
+    """PNG/JPEG → WebP 无损（省流量且不降质）。转失败或体积更大就原样返回。
+
+    放在「保存译文图时」调用：翻译本身要几十秒，这里多花一两百毫秒完全无感，
+    下载路径只是直接发预生成好的 .webp，零额外延迟。
+    """
+    if not S.IMAGE_COMPRESS:
+        return data
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(data))
+        has_alpha = img.mode in ("RGBA", "LA", "PA") or (
+            img.mode == "P" and "transparency" in img.info)
+        img = img.convert("RGBA" if has_alpha else "RGB")
+        buf = io.BytesIO()
+        # lossless=True 保证像素级无损；quality/method 只是压缩用力程度（越大越慢越小）
+        img.save(buf, format="WEBP", lossless=True, quality=90, method=6)
+        out = buf.getvalue()
+        return out if len(out) < len(data) else data   # 万一更大就保留原 PNG
+    except Exception:      # noqa: BLE001
+        return data
+
+
 def page_paths(book_id: str, page_index: int) -> tuple[Path, Path, Path]:
     d = S.BOOKS_DIR / _safe(book_id) / f"{page_index:06d}"
-    return d / "orig.png", d / "out.png", d / "result.json"
+    return d / "orig.png", d / "out.webp", d / "result.json"
 
 
 def _safe(name: str) -> str:
@@ -598,7 +622,7 @@ def _persist_page(book_id, page_index, order_dir, title, img_sha, cfg_hash, raw,
     row = db.query_one("SELECT id FROM pages WHERE book_id=%s AND page_index=%s", (book_id, page_index))
     page_id = row["id"]
     if out_bytes:
-        out_path.write_bytes(out_bytes)
+        out_path.write_bytes(_to_webp_lossless(out_bytes))
     if payload:
         json_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         db.execute("DELETE FROM page_blocks WHERE page_id=%s", (page_id,))
@@ -645,7 +669,8 @@ async def page_image(page_id: int, orig: int = Query(0, description="1=原图"))
     path = row["orig_path"] if orig else (row["out_path"] or row["orig_path"])
     if not path or not Path(path).exists():
         raise HTTPException(404, detail="image not available")
-    return FileResponse(path, media_type="image/png",
+    media = "image/webp" if str(path).lower().endswith(".webp") else "image/png"
+    return FileResponse(path, media_type=media,
                         headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
 

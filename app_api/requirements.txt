@@ -5,3 +5,4 @@ cryptography
 redis
 httpx
 python-multipart
+pillow

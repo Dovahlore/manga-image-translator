@@ -55,6 +55,13 @@ key.pem
 # mit-app-api 账号密码
 app.env
 
+# 内网穿透配置（含 frp token，不入库）
+docker/tunnel/frpc.toml
+
+# Android 签名（密钥库 + 密码，不入库）
+android/app/*.jks
+android/app/keystore.properties
+
 # 引擎密钥（DEEPSEEK_API_KEY 等）
 secret.env
 

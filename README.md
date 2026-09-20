@@ -1,4 +1,12 @@
 # Manga/Image Translator (English Readme)
+
+> ⭐ **Fork 新增：Android 漫画阅读器 App + FastAPI 后端 + frp 内网穿透**
+>
+> - **App**（`android/`，Kotlin/Compose）：导入 EPUB/MOBI、单页/全书翻译、捏合缩放、阅读进度、收藏夹/搜索、深浅色主题、UI 自动隐藏
+> - **后端**（`app_api/`，FastAPI）：整页翻译、L1 缓存、译文图 WebP 无损压缩（省流量）
+> - **部署**：`docker-compose.full.yml`（引擎+接口）+ `docker-compose.tunnel.yml`（frp 线上穿透，走你自己的服务器/域名）
+> - 📦 **Release APK**：见 [GitHub Releases](https://github.com/Dovahlore/manga-image-translator/releases)（v1.0）
+
 Last Updated: 2025/05/10
 ---
 ![Commit activity](https://img.shields.io/github/commit-activity/m/zyddnys/manga-image-translator)

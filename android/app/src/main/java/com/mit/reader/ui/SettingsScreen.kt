@@ -17,6 +17,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -53,13 +54,16 @@ fun SettingsScreen(onBack: () -> Unit) {
         Column(
             Modifier.fillMaxSize().padding(pad).padding(16.dp).verticalScroll(rememberScrollState()),
         ) {
-            Text("服务器地址（支持 http/https、域名、端口）", style = MaterialTheme.typography.labelMedium)
+            Text(
+                "服务器地址（局域网填 http://IP:8020，线上填 https://域名）",
+                style = MaterialTheme.typography.labelMedium,
+            )
             OutlinedTextField(
                 value = url,
                 onValueChange = { url = it },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
-                placeholder = { Text("http://10.0.2.2:8020 或 https://your.domain:8020") },
+                placeholder = { Text("http://192.168.0.90:8020 或 https://mit.example.com") },
             )
             Text(
                 "API Key（鉴权用，与服务端 app.env 的 MIT_API_TOKEN 一致）",
@@ -92,6 +96,12 @@ fun SettingsScreen(onBack: () -> Unit) {
                     modifier = Modifier.weight(1f).padding(start = 8.dp),
                 ) { Text("测试连接") }
             }
+            TextButton(
+                onClick = {
+                    url = ServerConfig.DEFAULT_URL
+                    result = "已填回局域网默认地址（保存后生效）"
+                },
+            ) { Text("恢复局域网默认地址") }
             if (result.isNotBlank()) {
                 Text(result, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 12.dp))
             }

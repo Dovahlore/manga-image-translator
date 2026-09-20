@@ -32,6 +32,10 @@ CONTEXT_PAGES = int(os.getenv("MIT_CONTEXT_PAGES", "1"))
 # 单页翻译超时（秒）
 ENGINE_TIMEOUT = float(os.getenv("MIT_ENGINE_TIMEOUT", "900"))
 
+# 图片无损压缩：译文图 PNG → WebP 无损（省流量且不降质，保存时转，下载零额外延迟）。
+# 0 = 关闭（直接存/发 PNG）
+IMAGE_COMPRESS = int(os.getenv("MIT_IMAGE_COMPRESS", "1"))
+
 # L1 结果缓存的 TTL（秒）：图片按内容 hash 落磁盘，结构化结果 JSON 放 Redis。
 # 0 = 永不过期（依赖 Redis AOF 持久化）；默认 14 天，过期就重跑管线。
 CACHE_TTL = int(os.getenv("MIT_CACHE_TTL", "1209600"))

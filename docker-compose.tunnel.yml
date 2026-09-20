@@ -1,0 +1,29 @@
+# ============================================================
+#  线上模式（内网穿透）：把本地 mit-app-api(8020) 穿到你的 VPS / 域名
+#
+#  只加一个轻量容器：frpc（frp 客户端，约 20MB 单二进制），连到你 VPS 上的 frps。
+#  适合「我有自己的服务器 + 域名」：不需要 Cloudflare，域名走你自己的 HTTPS。
+#
+#  局域网模式不受影响：docker-compose.full.yml 仍把 8020 开在局域网。
+#  两种模式并存，App「设置 → 服务器地址」填哪个用哪个。
+#
+#  用法（先改 docker/tunnel/frpc.toml 里的 serverAddr / token，再一起起）：
+#    docker compose --env-file app.env \
+#      -f docker-compose.full.yml -f docker-compose.tunnel.yml up -d
+#
+#  完整步骤见 docker/tunnel/README.md（含 VPS 侧 frps + nginx/域名配置）。
+# ============================================================
+
+services:
+  # ---------- 隧道客户端：把 app-api:8000 透传到 VPS ----------
+  frpc:
+    # 默认走 DaoCloud 镜像（国内直连 Docker Hub 常失败）；可覆盖
+    image: ${MIT_FRPC_IMAGE:-docker.m.daocloud.io/snowdreamtech/frpc:latest}
+    container_name: mit-frpc
+    depends_on:
+      - app-api
+    volumes:
+      - ./docker/tunnel/frpc.toml:/etc/frp/frpc.toml:ro
+    entrypoint: ["frpc"]
+    command: ["-c", "/etc/frp/frpc.toml"]
+    restart: unless-stopped
