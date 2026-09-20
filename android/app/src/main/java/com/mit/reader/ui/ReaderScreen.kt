@@ -1,11 +1,15 @@
 package com.mit.reader.ui
 
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.LocalIndication
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.PressInteraction
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -23,8 +27,8 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
@@ -35,7 +39,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
@@ -49,6 +55,7 @@ import com.mit.reader.PageStatus
 import com.mit.reader.ReaderApp
 import com.mit.reader.ReaderViewModel
 import com.mit.reader.data.ReadingMode
+import kotlinx.coroutines.flow.collect
 
 private const val MAX_ZOOM = 5f
 
@@ -127,29 +134,13 @@ fun ReaderScreen(bookId: String, onBack: () -> Unit) {
                         else -> Text("翻译本页")
                     }
                 }
-                OutlinedButton(
-                    onClick = {},
+                ToggleViewButton(
                     enabled = status == PageStatus.DONE,
-                    modifier = Modifier.pointerInput(status) {
-                        if (status != PageStatus.DONE) return@pointerInput
-                        detectTapGestures(
-                            onPress = {
-                                if (tryAwaitRelease()) {
-                                    // 短按：固定切换 译文 ↔ 原图
-                                    vm.toggleOriginal()
-                                } else {
-                                    // 长按：临时切到另一视图，松开即恢复
-                                    vm.setPeek(true)
-                                    tryAwaitRelease()
-                                    vm.setPeek(false)
-                                }
-                            },
-                        )
-                    },
-                ) {
-                    // 默认展示译文，短按切回原图；长按临时切换
-                    Text(if (vm.showOriginal) "看译文" else "看原图")
-                }
+                    showOriginal = vm.showOriginal,
+                    onToggle = { vm.toggleOriginal() },
+                    onPeekStart = { vm.setPeek(true) },
+                    onPeekEnd = { vm.setPeek(false) },
+                )
             }
         },
     ) { pad ->
@@ -173,6 +164,51 @@ fun ReaderScreen(bookId: String, onBack: () -> Unit) {
     }
 }
 
+/** 切换译文/原图按钮：短按固定切换，长按临时切到另一视图、松开恢复。 */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ToggleViewButton(
+    enabled: Boolean,
+    showOriginal: Boolean,
+    onToggle: () -> Unit,
+    onPeekStart: () -> Unit,
+    onPeekEnd: () -> Unit,
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+
+    // 长按进入临时切换后，松开/取消时恢复（Peek）
+    LaunchedEffect(interactionSource) {
+        interactionSource.interactions.collect { interaction ->
+            when (interaction) {
+                is PressInteraction.Release -> onPeekEnd()
+                is PressInteraction.Cancel -> onPeekEnd()
+                else -> Unit
+            }
+        }
+    }
+
+    Surface(
+        shape = MaterialTheme.shapes.small,
+        color = Color.Transparent,
+        contentColor = if (enabled) MaterialTheme.colorScheme.primary
+        else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+        modifier = Modifier.combinedClickable(
+            interactionSource = interactionSource,
+            indication = LocalIndication.current,
+            enabled = enabled,
+            onClick = { onToggle() },        // 短按：固定切换
+            onLongClick = { onPeekStart() }, // 长按：临时切换
+        ),
+    ) {
+        Text(
+            text = if (showOriginal) "看译文" else "看原图",
+            style = MaterialTheme.typography.labelLarge,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+        )
+    }
+}
+
 /** 可双指捏合放大/缩小的图片；放大后单指拖动平移，1x 下单指横滑仍留给 pager 翻页。 */
 @Composable
 private fun ZoomableImage(
@@ -187,12 +223,12 @@ private fun ZoomableImage(
     Box(
         modifier = modifier
             .onSizeChanged { viewport.value = it }
+            .clipToBounds()
             .graphicsLayer {
                 scaleX = scale.floatValue
                 scaleY = scale.floatValue
                 translationX = offset.value.x
                 translationY = offset.value.y
-                clip = true
             }
             .pointerInput(Unit) {
                 awaitEachGesture {
@@ -202,16 +238,11 @@ private fun ZoomableImage(
                         val pressed = event.changes.count { it.pressed }
                         val zoomChange = event.calculateZoom()
                         val panChange = event.calculatePan()
-                        val centroid = event.calculateCentroid()
                         // 只在双指捏合、或已经放大后的单指拖动时接管手势；
                         // 1x 下单指横滑不消费，交给 pager 翻页。
                         if (pressed >= 2 || scale.floatValue > 1f) {
-                            val old = scale.floatValue
-                            val next = (old * zoomChange).coerceIn(1f, MAX_ZOOM)
-                            val ratio = if (old > 0f) next / old else 1f
-                            val newOffset = centroid - (centroid - offset.value) * ratio + panChange
-                            scale.floatValue = next
-                            offset.value = clampOffset(newOffset, next, viewport.value)
+                            scale.floatValue = (scale.floatValue * zoomChange).coerceIn(1f, MAX_ZOOM)
+                            offset.value = clampOffset(offset.value + panChange, scale.floatValue, viewport.value)
                             event.changes.forEach { it.consume() }
                         }
                     } while (event.changes.any { it.pressed })
