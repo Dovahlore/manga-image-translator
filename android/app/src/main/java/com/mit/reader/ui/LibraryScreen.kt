@@ -28,7 +28,9 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
@@ -87,6 +89,8 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
     var confirmDeleteFolder by remember { mutableStateOf<Folder?>(null) }
     var folderMenuTarget by remember { mutableStateOf<Folder?>(null) }
     var renameTarget by remember { mutableStateOf<Folder?>(null) }
+    var searchActive by remember { mutableStateOf(false) }
+    var searchQuery by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
 
     fun reload() { refreshing++ }
@@ -119,16 +123,36 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("书库") },
+                title = {
+                    if (searchActive) {
+                        OutlinedTextField(
+                            value = searchQuery,
+                            onValueChange = { searchQuery = it },
+                            placeholder = { Text("搜索书名 / 收藏夹") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    } else {
+                        Text("书库")
+                    }
+                },
                 navigationIcon = {
-                    if (currentFolderId != null) {
-                        IconButton(onClick = { currentFolderId = null }) {
+                    when {
+                        searchActive -> IconButton(onClick = { searchActive = false; searchQuery = "" }) {
+                            Icon(Icons.Default.ArrowBack, contentDescription = "退出搜索")
+                        }
+                        currentFolderId != null -> IconButton(onClick = { currentFolderId = null }) {
                             Icon(Icons.Default.ArrowBack, contentDescription = "返回")
                         }
                     }
                 },
                 actions = {
-                    IconButton(onClick = onSettings) { Icon(Icons.Default.Settings, contentDescription = "设置") }
+                    if (searchActive) {
+                        IconButton(onClick = { searchQuery = "" }) { Icon(Icons.Default.Close, contentDescription = "清空") }
+                    } else {
+                        IconButton(onClick = { searchActive = true }) { Icon(Icons.Default.Search, contentDescription = "搜索") }
+                        IconButton(onClick = onSettings) { Icon(Icons.Default.Settings, contentDescription = "设置") }
+                    }
                 },
             )
         },
@@ -139,39 +163,49 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
         },
     ) { pad ->
         Column(Modifier.fillMaxSize().padding(pad)) {
-            TabRow(selectedTabIndex = tab) {
-                Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("书库") })
-                Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("翻译进度") })
-            }
-            if (tab == 0) {
-                LibraryTab(
+            if (searchActive) {
+                SearchResults(
+                    query = searchQuery,
                     books = books,
                     folders = folders,
-                    currentFolderId = currentFolderId,
-                    onOpen = onOpen,
-                    onEnterFolder = { currentFolderId = it },
-                    onNewFolder = { showCreateFolder = true },
-                    onMoveBook = { moveTarget = it },
-                    onMoveToFolder = { book, fid ->
-                        scope.launch { app.library.moveBook(book.id, fid); reload() }
-                    },
-                    onMoveOut = { book ->
-                        scope.launch { app.library.moveBook(book.id, null); reload() }
-                    },
-                    onDelete = { confirmDelete = it },
-                    onFolderMenu = { folderMenuTarget = it },
-                    onTranslateAll = { app.startTranslateAll(it) },
-                    translatingBookId = app.translatingBookId,
-                    translatingProgress = app.translatingProgress,
+                    onOpenBook = { id -> searchActive = false; searchQuery = ""; onOpen(id) },
+                    onEnterFolder = { id -> searchActive = false; searchQuery = ""; currentFolderId = id },
                 )
             } else {
-                ProgressList(
-                    books = books,
-                    serverBooks = serverBooks,
-                    error = progressErr,
-                    translatingBookId = app.translatingBookId,
-                    translatingProgress = app.translatingProgress,
-                )
+                TabRow(selectedTabIndex = tab) {
+                    Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("书库") })
+                    Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("翻译进度") })
+                }
+                if (tab == 0) {
+                    LibraryTab(
+                        books = books,
+                        folders = folders,
+                        currentFolderId = currentFolderId,
+                        onOpen = onOpen,
+                        onEnterFolder = { currentFolderId = it },
+                        onNewFolder = { showCreateFolder = true },
+                        onMoveBook = { moveTarget = it },
+                        onMoveToFolder = { book, fid ->
+                            scope.launch { app.library.moveBook(book.id, fid); reload() }
+                        },
+                        onMoveOut = { book ->
+                            scope.launch { app.library.moveBook(book.id, null); reload() }
+                        },
+                        onDelete = { confirmDelete = it },
+                        onFolderMenu = { folderMenuTarget = it },
+                        onTranslateAll = { app.startTranslateAll(it) },
+                        translatingBookId = app.translatingBookId,
+                        translatingProgress = app.translatingProgress,
+                    )
+                } else {
+                    ProgressList(
+                        books = books,
+                        serverBooks = serverBooks,
+                        error = progressErr,
+                        translatingBookId = app.translatingBookId,
+                        translatingProgress = app.translatingProgress,
+                    )
+                }
             }
         }
     }
@@ -698,6 +732,90 @@ private fun BookProgressRow(
             LinearProgressIndicator(
                 progress = { done.toFloat() / total.toFloat() },
                 modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+            )
+        }
+    }
+}
+
+/** 搜索：同时匹配收藏夹名和书名（含文件夹里的书）。点书打开、点文件夹跳进去。 */
+@Composable
+private fun SearchResults(
+    query: String,
+    books: List<Book>,
+    folders: List<Folder>,
+    onOpenBook: (String) -> Unit,
+    onEnterFolder: (String) -> Unit,
+) {
+    val q = query.trim()
+    if (q.isEmpty()) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Text("输入书名或收藏夹名", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        return
+    }
+    val folderById = folders.associateBy { it.id }
+    val matchedFolders = folders.filter { it.name.contains(q, ignoreCase = true) }
+    val matchedBooks = books.filter { it.title.contains(q, ignoreCase = true) }
+    if (matchedFolders.isEmpty() && matchedBooks.isEmpty()) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Text("没有找到「$q」", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        return
+    }
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(12.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        if (matchedFolders.isNotEmpty()) {
+            item {
+                Text(
+                    "收藏夹",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(vertical = 6.dp),
+                )
+            }
+            listItems(matchedFolders, key = { it.id }) { folder ->
+                SearchRow(
+                    title = folder.name,
+                    subtitle = "${books.count { it.folderId == folder.id }} 本",
+                    onClick = { onEnterFolder(folder.id) },
+                )
+            }
+        }
+        if (matchedBooks.isNotEmpty()) {
+            item {
+                Text(
+                    "漫画",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(vertical = 6.dp),
+                )
+            }
+            listItems(matchedBooks, key = { it.id }) { book ->
+                val folderName = book.folderId?.let { folderById[it]?.name }
+                SearchRow(
+                    title = book.title,
+                    subtitle = if (folderName != null) "在「$folderName」" else "未分类",
+                    onClick = { onOpenBook(book.id) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SearchRow(title: String, subtitle: String?, onClick: () -> Unit) {
+    Column(
+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 8.dp, horizontal = 4.dp),
+    ) {
+        Text(title, style = MaterialTheme.typography.bodyLarge, maxLines = 1)
+        if (subtitle != null) {
+            Text(
+                subtitle,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
     }
