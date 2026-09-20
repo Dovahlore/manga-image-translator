@@ -341,9 +341,14 @@ private fun ZoomableImage(
                         // 只在双指捏合、或已经放大后的单指拖动时接管手势；
                         // 1x 下单指横滑不消费，交给 pager 翻页。
                         if (pressed >= 2 || scale.floatValue > 1f) {
-                            val zoomChange = event.calculateZoom()
                             val panChange = event.calculatePan()
-                            val newScale = (scale.floatValue * zoomChange).coerceIn(1f, MAX_ZOOM)
+                            // 只有双指才改缩放；单指 calculateZoom 是「手指到屏幕原点的距离比」，
+                            // 会随手指位置漂移导致缩放乱跳（也是拖动像有阻力的元凶）
+                            val newScale = if (pressed >= 2) {
+                                (scale.floatValue * event.calculateZoom()).coerceIn(1f, MAX_ZOOM)
+                            } else {
+                                scale.floatValue
+                            }
                             scale.floatValue = newScale
 
                             if (pressed == 1 && newScale > 1f) {
@@ -377,7 +382,7 @@ private fun ZoomableImage(
 
                     // 放大后滑到边缘继续滑 → 松手翻页
                     if (maxPointers == 1 && scale.floatValue > 1f && viewport.value.width > 0) {
-                        val threshold = viewport.value.width * 0.25f
+                        val threshold = viewport.value.width * 0.12f
                         if (abs(overscrollX) > threshold) {
                             val forward = if (reverseLayout) overscrollX > 0f else overscrollX < 0f
                             val target = (pagerState.currentPage + if (forward) 1 else -1)
