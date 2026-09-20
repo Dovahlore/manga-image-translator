@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.PagerState
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
@@ -67,6 +68,7 @@ import com.mit.reader.PageStatus
 import com.mit.reader.ReaderApp
 import com.mit.reader.ReaderViewModel
 import com.mit.reader.data.ReadingMode
+import kotlin.math.abs
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
@@ -210,6 +212,9 @@ fun ReaderScreen(bookId: String, onBack: () -> Unit) {
                     model = file,
                     contentDescription = "第 ${i + 1} 页",
                     onSingleTap = { vm.toggleOriginal() },
+                    pagerState = pagerState,
+                    reverseLayout = book.mode == ReadingMode.MANGA,
+                    pageCount = book.pageCount,
                     modifier = Modifier.fillMaxSize(),
                 )
             }
@@ -282,12 +287,16 @@ private fun ZoomableImage(
     model: Any?,
     contentDescription: String?,
     onSingleTap: () -> Unit,
+    pagerState: PagerState,
+    reverseLayout: Boolean,
+    pageCount: Int,
     modifier: Modifier = Modifier,
 ) {
     val scale = remember { mutableFloatStateOf(1f) }
     val offset = remember { mutableStateOf(Offset.Zero) }
     val viewport = remember { mutableStateOf(IntSize.Zero) }
     val viewConfig = LocalViewConfiguration.current
+    val scope = rememberCoroutineScope()
 
     // 单击/双击判定：单击延迟到双击超时后再触发，双击放大
     var tapSeq by remember { mutableIntStateOf(0) }
@@ -346,6 +355,7 @@ private fun ZoomableImage(
                     var totalMove = 0f
                     var lastPos = downPos
                     var maxPointers = 1
+                    var overscrollX = 0f
                     do {
                         val event = awaitPointerEvent()
                         val pressed = event.changes.count { it.pressed }
@@ -356,14 +366,49 @@ private fun ZoomableImage(
                         // 只在双指捏合、或已经放大后的单指拖动时接管手势；
                         // 1x 下单指横滑不消费，交给 pager 翻页。
                         if (pressed >= 2 || scale.floatValue > 1f) {
-                            scale.floatValue = (scale.floatValue * event.calculateZoom()).coerceIn(1f, MAX_ZOOM)
-                            offset.value = clampOffset(offset.value + event.calculatePan(), scale.floatValue, viewport.value)
+                            val zoomChange = event.calculateZoom()
+                            val panChange = event.calculatePan()
+                            val newScale = (scale.floatValue * zoomChange).coerceIn(1f, MAX_ZOOM)
+                            scale.floatValue = newScale
+
+                            if (pressed == 1 && newScale > 1f) {
+                                // 放大后的单指平移：滑到水平边缘再继续外滑 → 累计翻页距离
+                                val maxX = viewport.value.width * (newScale - 1f) / 2f
+                                val panX = panChange.x
+                                val atLeft = offset.value.x <= -maxX + 0.5f
+                                val atRight = offset.value.x >= maxX - 0.5f
+                                if ((atLeft && panX < 0f) || (atRight && panX > 0f)) {
+                                    overscrollX += panX
+                                } else {
+                                    offset.value = clampOffset(offset.value + panChange, newScale, viewport.value)
+                                    overscrollX = 0f
+                                }
+                            } else {
+                                offset.value = clampOffset(offset.value + panChange, newScale, viewport.value)
+                            }
                             event.changes.forEach { it.consume() }
                         }
                     } while (event.changes.any { it.pressed })
+
                     // 单指、几乎没移动 → 判定为一次点击
                     if (maxPointers == 1 && totalMove < viewConfig.touchSlop) {
                         currentRegisterTap(downPos)
+                    }
+
+                    // 放大后滑到边缘继续滑 → 松手翻页
+                    if (maxPointers == 1 && scale.floatValue > 1f && viewport.value.width > 0) {
+                        val threshold = viewport.value.width * 0.25f
+                        if (abs(overscrollX) > threshold) {
+                            val forward = if (reverseLayout) overscrollX > 0f else overscrollX < 0f
+                            val target = (pagerState.currentPage + if (forward) 1 else -1)
+                                .coerceIn(0, pageCount - 1)
+                            scale.floatValue = 1f
+                            offset.value = Offset.Zero
+                            if (target != pagerState.currentPage) {
+                                val t = target
+                                scope.launch { pagerState.animateScrollToPage(t) }
+                            }
+                        }
                     }
                 }
             },
