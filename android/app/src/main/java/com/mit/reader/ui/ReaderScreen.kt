@@ -53,7 +53,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.unit.IntSize
@@ -310,7 +310,7 @@ private fun ZoomableImage(
 
     Box(
         modifier = modifier
-            .onSizeChanged { viewport.value = it }
+            .onGloballyPositioned { viewport.value = it.size }
             .clipToBounds()
             .graphicsLayer {
                 scaleX = scale.floatValue
@@ -326,6 +326,8 @@ private fun ZoomableImage(
                     var lastPos = downPos
                     var maxPointers = 1
                     var overscrollX = 0f
+                    var lastVelocity = Offset.Zero
+                    var lastEventTime = 0L
                     do {
                         val event = awaitPointerEvent()
                         val pressed = event.changes.count { it.pressed }
@@ -340,6 +342,13 @@ private fun ZoomableImage(
                         // 1x 下单指横滑不消费，交给 pager 翻页。
                         if (pressed >= 2 || scale.floatValue > 1f) {
                             val panChange = event.calculatePan()
+                            // 记录平移速度（松手后做惯性滑动用）
+                            val nowMs = SystemClock.uptimeMillis()
+                            if (lastEventTime != 0L) {
+                                val dt = ((nowMs - lastEventTime).coerceAtLeast(1L)) / 1000f
+                                lastVelocity = Offset(panChange.x / dt, panChange.y / dt)
+                            }
+                            lastEventTime = nowMs
                             // 只有双指才改缩放；单指 calculateZoom 是「手指到屏幕原点的距离比」，
                             // 会随手指位置漂移导致缩放乱跳（也是拖动像有阻力的元凶）
                             val newScale = if (pressed >= 2) {
@@ -390,6 +399,21 @@ private fun ZoomableImage(
                             if (target != pagerState.currentPage) {
                                 val t = target
                                 scope.launch { pagerState.animateScrollToPage(t) }
+                            }
+                        }
+                    } else if (maxPointers == 1 && scale.floatValue > 1f && lastVelocity.getDistance() > 500f) {
+                        // 松手后按速度惯性滑动（放大浏览大图更省劲）
+                        val v0 = lastVelocity
+                        scope.launch {
+                            var v = v0
+                            while (v.getDistance() > 25f) {
+                                offset.value = clampOffset(
+                                    offset.value + Offset(v.x * 0.016f, v.y * 0.016f),
+                                    scale.floatValue,
+                                    viewport.value,
+                                )
+                                v = Offset(v.x * 0.92f, v.y * 0.92f)
+                                delay(16)
                             }
                         }
                     }
