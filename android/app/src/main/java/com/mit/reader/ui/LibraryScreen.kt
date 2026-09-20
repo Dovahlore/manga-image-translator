@@ -111,7 +111,13 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
         uri ?: return@rememberLauncherForActivityResult
         scope.launch {
             runCatching { app.library.import(uri) }
-                .onSuccess { reload() }
+                .onSuccess { book ->
+                    // 在收藏夹里导入的，直接放进当前收藏夹
+                    currentFolderId?.let { fid ->
+                        runCatching { app.library.moveBook(book.id, fid) }
+                    }
+                    reload()
+                }
                 .onFailure { e -> Toast.makeText(app, "导入失败：${e.message}", Toast.LENGTH_LONG).show() }
         }
     }
@@ -378,7 +384,8 @@ private fun LibraryTab(
     }
 
     val unFiled = books.filter { it.folderId == null }
-    if (books.isEmpty()) {
+    // 完全空（没书也没收藏夹）才显示引导；有收藏夹时即使没书也要把收藏夹展示出来
+    if (books.isEmpty() && folders.isEmpty()) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text("点右下角 + 导入 EPUB / MOBI", color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -415,18 +422,29 @@ private fun LibraryTab(
                 onFolderMenu = onFolderMenu,
             )
         }
-        gridItems(unFiled, key = { it.id }) { book ->
-            BookCell(
-                book = book,
-                inFolder = false,
-                onOpen = { onOpen(book.id) },
-                onLongPress = { onMoveBook(book) },
-                onTranslateAll = { onTranslateAll(book) },
-                onMove = { onMoveBook(book) },
-                onDelete = { onDelete(book) },
-                isTranslating = translatingBookId == book.id,
-                progressText = if (translatingBookId == book.id) translatingProgress?.let { "${it.first}/${it.second}" } else null,
-            )
+        if (unFiled.isNotEmpty()) {
+            gridItems(unFiled, key = { it.id }) { book ->
+                BookCell(
+                    book = book,
+                    inFolder = false,
+                    onOpen = { onOpen(book.id) },
+                    onLongPress = { onMoveBook(book) },
+                    onTranslateAll = { onTranslateAll(book) },
+                    onMove = { onMoveBook(book) },
+                    onDelete = { onDelete(book) },
+                    isTranslating = translatingBookId == book.id,
+                    progressText = if (translatingBookId == book.id) translatingProgress?.let { "${it.first}/${it.second}" } else null,
+                )
+            }
+        } else if (books.isEmpty()) {
+            // 没书但已有收藏夹：给个导入提示，收藏夹区仍正常展示
+            item(span = { GridItemSpan(maxLineSpan) }) {
+                Text(
+                    "点右下角 + 导入 EPUB / MOBI",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(vertical = 8.dp),
+                )
+            }
         }
     }
 }
