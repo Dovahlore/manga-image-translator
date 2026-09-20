@@ -55,11 +55,14 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
+import coil.compose.SubcomposeAsyncImage
+import coil.compose.SubcomposeAsyncImageContent
 import com.mit.reader.PageStatus
 import com.mit.reader.ReaderApp
 import com.mit.reader.ReaderViewModel
@@ -267,8 +270,10 @@ private fun ZoomableImage(
     val scale = remember { mutableFloatStateOf(1f) }
     val offset = remember { mutableStateOf(Offset.Zero) }
     val viewport = remember { mutableStateOf(IntSize.Zero) }
+    val fittedSize = remember { mutableStateOf(IntSize.Zero) }
     val viewConfig = LocalViewConfiguration.current
     val scope = rememberCoroutineScope()
+    val density = LocalDensity.current
 
     // 单击/双击判定：单击延迟到双击超时后再触发，双击放大
     var tapSeq by remember { mutableIntStateOf(0) }
@@ -311,14 +316,21 @@ private fun ZoomableImage(
     Box(
         modifier = modifier
             .onGloballyPositioned { viewport.value = it.size }
-            .clipToBounds()
-            .graphicsLayer {
-                scaleX = scale.floatValue
-                scaleY = scale.floatValue
-                translationX = offset.value.x
-                translationY = offset.value.y
-            }
-            .pointerInput(Unit) {
+            .clipToBounds(),
+        contentAlignment = Alignment.Center,
+    ) {
+        SubcomposeAsyncImage(
+            model = model,
+            contentDescription = contentDescription,
+            contentScale = ContentScale.FillBounds,
+            modifier = Modifier
+                .graphicsLayer {
+                    scaleX = scale.floatValue
+                    scaleY = scale.floatValue
+                    translationX = offset.value.x
+                    translationY = offset.value.y
+                }
+                .pointerInput(Unit) {
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
                     val downPos = down.position
@@ -360,8 +372,8 @@ private fun ZoomableImage(
 
                             if (pressed == 1 && newScale > 1f) {
                                 // 放大后的单指平移：水平滑到边缘继续外滑 → 累计翻页距离；垂直始终平移
-                                val maxX = viewport.value.width * (newScale - 1f) / 2f
-                                val maxY = viewport.value.height * (newScale - 1f) / 2f
+                                val maxX = ((fittedSize.value.width * newScale - viewport.value.width) / 2f).coerceAtLeast(0f)
+                                val maxY = ((fittedSize.value.height * newScale - viewport.value.height) / 2f).coerceAtLeast(0f)
                                 val panX = panChange.x
                                 val panY = panChange.y
                                 val atLeft = offset.value.x <= -maxX + 0.5f
@@ -376,7 +388,7 @@ private fun ZoomableImage(
                                 val newY = (offset.value.y + panY).coerceIn(-maxY, maxY)
                                 offset.value = Offset(newX, newY)
                             } else {
-                                offset.value = clampOffset(offset.value + panChange, newScale, viewport.value)
+                                offset.value = clampOffset(offset.value + panChange, newScale, fittedSize.value, viewport.value)
                             }
                             event.changes.forEach { it.consume() }
                         }
@@ -410,6 +422,7 @@ private fun ZoomableImage(
                                 offset.value = clampOffset(
                                     offset.value + Offset(v.x * 0.016f, v.y * 0.016f),
                                     scale.floatValue,
+                                    fittedSize.value,
                                     viewport.value,
                                 )
                                 v = Offset(v.x * 0.92f, v.y * 0.92f)
@@ -419,20 +432,28 @@ private fun ZoomableImage(
                     }
                 }
             },
-    ) {
-        AsyncImage(
-            model = model,
-            contentDescription = contentDescription,
-            contentScale = ContentScale.Fit,
-            modifier = Modifier.fillMaxSize(),
-        )
+        ) {
+            val intrinsic = painter.intrinsicSize
+            val vp = viewport.value
+            if (intrinsic.width > 0f && intrinsic.height > 0f && vp.width > 0 && vp.height > 0) {
+                val factor = minOf(vp.width / intrinsic.width, vp.height / intrinsic.height)
+                val w = (intrinsic.width * factor).toInt().coerceAtLeast(1)
+                val h = (intrinsic.height * factor).toInt().coerceAtLeast(1)
+                fittedSize.value = IntSize(w, h)
+                SubcomposeAsyncImageContent(
+                    modifier = Modifier.size(with(density) { w.toDp() }, with(density) { h.toDp() }),
+                )
+            } else {
+                SubcomposeAsyncImageContent()
+            }
+        }
     }
 }
 
-/** 把平移量限制在内容放大后刚好不脱出视口的范围（1x 时强制归零）。 */
-private fun clampOffset(o: Offset, scale: Float, viewport: IntSize): Offset {
-    if (viewport == IntSize.Zero) return Offset.Zero
-    val maxX = viewport.width * (scale - 1f) / 2f
-    val maxY = viewport.height * (scale - 1f) / 2f
+/** 把平移量限制在图片放大后刚好不脱出视口的范围（按图片实际 fit 尺寸算，1x 时强制归零）。 */
+private fun clampOffset(o: Offset, scale: Float, fitted: IntSize, viewport: IntSize): Offset {
+    if (fitted == IntSize.Zero || viewport == IntSize.Zero) return Offset.Zero
+    val maxX = ((fitted.width * scale - viewport.width) / 2f).coerceAtLeast(0f)
+    val maxY = ((fitted.height * scale - viewport.height) / 2f).coerceAtLeast(0f)
     return Offset(o.x.coerceIn(-maxX, maxX), o.y.coerceIn(-maxY, maxY))
 }
