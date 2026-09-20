@@ -360,9 +360,12 @@ private fun ZoomableImage(
                         val event = awaitPointerEvent()
                         val pressed = event.changes.count { it.pressed }
                         if (pressed > maxPointers) maxPointers = pressed
-                        val centroid = event.calculateCentroid()
-                        totalMove += (centroid - lastPos).getDistance()
-                        lastPos = centroid
+                        // 只有还有手指按着才算移动；抬起那一下 calculateCentroid 会返回 (0,0)，会误判成大位移
+                        if (pressed > 0) {
+                            val centroid = event.calculateCentroid()
+                            totalMove += (centroid - lastPos).getDistance()
+                            lastPos = centroid
+                        }
                         // 只在双指捏合、或已经放大后的单指拖动时接管手势；
                         // 1x 下单指横滑不消费，交给 pager 翻页。
                         if (pressed >= 2 || scale.floatValue > 1f) {
