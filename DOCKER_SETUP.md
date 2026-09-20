@@ -10,8 +10,6 @@
 |---|---|
 | `Dockerfile.cu128` | CUDA 12.8 基镜像（PyTorch 2.8）；不在构建期下载模型，不装 gimp |
 | `docker-compose.full.yml` | **全栈编排**：引擎 + MySQL + Redis + App 接口（项目名 `mit`） |
-| `docker-compose.app.yml` | 只是 `include: docker-compose.full.yml` 的别名，老命令照样能用 |
-| `docker-compose.cu128.yml` | 上游那份的 CUDA 12.8 变体（只用于「只跑引擎」的场景） |
 | `mit-app.ps1` | **全栈一键脚本**：up/down/status/build/test/logs/sql/redis |
 | `mit-docker.ps1` | 引擎侧脚本：probe/gpu-test/net-test/build/cli/shell/api；up/down 已转发给 compose |
 | `mit-smoketest.ps1` | 引擎冒烟测试 |

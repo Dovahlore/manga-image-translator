@@ -22,8 +22,7 @@
 | `mit-app-redis` | 127.0.0.1:56379 | Redis（requirepass） |
 
 - **编排/启动**：`docker-compose.full.yml`（compose 项目名 `mit`，网络 `mit_default`）——
-  引擎 + MySQL + Redis + App 接口一个文件全包。`docker-compose.app.yml` 现在只是
-  `include: docker-compose.full.yml` 的别名，老命令照样能用。
+  引擎 + MySQL + Redis + App 接口一个文件全包（旧的 `docker-compose.app.yml` 别名已删除）。
 - **app-api 通过服务名 `engine:8000` 访问引擎**，不再绕 `host.docker.internal:8010`（少一跳 NAT）
 - 口令统一 `Alexmercer2000@`，配置在 `项目根/app.env`；引擎密钥 `项目根/secret.env`（**都已 gitignore**）
 - **数据/模型全部在项目内**（`_runtime/` 已 gitignore，约 5GB）：

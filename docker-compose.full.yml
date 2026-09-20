@@ -9,7 +9,6 @@
 #  或用封装脚本（推荐，省得记这些参数）：
 #    .\mit-app.ps1 up | down | status | logs | engine-logs | build | test | sql | redis
 #
-#  兼容老文件名：docker-compose.app.yml 现在只是 include 本文件。
 #  mit-docker.ps1 仍可用（build/probe/gpu-test/net-test/cli/shell/api），
 #  但它的 up/down/restart/logs 已经改成转发到本文件，避免两套东西抢同一个容器名。
 #

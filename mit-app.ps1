@@ -1,4 +1,4 @@
-﻿# ============================================================
+# ============================================================
 #  mit 全栈 Docker 助手（引擎 + MySQL + Redis + App 接口）
 #
 #    .\mit-app.ps1 up          构建需要的镜像并按依赖顺序起全部 4 个容器
@@ -13,7 +13,7 @@
 #    .\mit-app.ps1 engine-restart  重启引擎（会清掉引擎里的共享实例状态，模型需重新加载）
 #    .\mit-app.ps1 sql / redis 进 MySQL / Redis 命令行
 #
-#  实际编排文件是 docker-compose.full.yml（docker-compose.app.yml 只是 include 它）。
+#  实际编排文件是 docker-compose.full.yml。
 #  引擎单独的操作（probe / gpu-test / net-test / cli / shell / api）仍走 .\mit-docker.ps1。
 # ============================================================
 param(
