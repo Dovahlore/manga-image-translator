@@ -13,6 +13,13 @@ import java.util.concurrent.TimeUnit
 data class TranslateResp(val pageId: Int, val jobId: String?, val cached: Boolean)
 data class JobStatus(val status: String, val pageId: Int?, val error: String?)
 data class ServerPage(val id: Int, val pageIndex: Int, val status: String)
+data class ServerBook(
+    val id: String,
+    val title: String?,
+    val pageCount: Int?,
+    val donePages: Int,
+    val failedPages: Int,
+)
 
 /**
  * app_api 客户端。地址 / API Key 每次都从 ServerConfig 现取（改完设置立刻生效）。
@@ -69,6 +76,28 @@ class TranslationApi {
             )
         }
     }
+
+    /** 拉服务端全部书的翻译汇总（done/failed 页数），给书库「翻译进度」页用。 */
+    suspend fun listBooks(): List<ServerBook> =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val req = Request.Builder().url("$base/v1/books").authed().build()
+            client.newCall(req).execute().use { resp ->
+                val text = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code}: ${text.take(200)}")
+                val j = JSONObject(text)
+                val arr = j.optJSONArray("books") ?: JSONArray()
+                (0 until arr.length()).map { i ->
+                    val o = arr.getJSONObject(i)
+                    ServerBook(
+                        id = o.getString("id"),
+                        title = o.optString("title").takeIf { it.isNotBlank() },
+                        pageCount = if (o.isNull("page_count")) null else o.optInt("page_count"),
+                        donePages = o.optInt("done_pages", 0),
+                        failedPages = o.optInt("failed_pages", 0),
+                    )
+                }
+            }
+        }
 
     /** 查某本书在服务端已有的页（page_id/page_index/status），用于全书翻译时跳过已翻好的页。 */
     suspend fun bookPages(bookId: String): List<ServerPage> =

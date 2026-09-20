@@ -725,7 +725,10 @@ async def upsert_book(body: dict):
 @app.get("/v1/books", dependencies=[Depends(auth)])
 async def list_books():
     return {"books": await run_in_threadpool(
-        db.query, "SELECT b.*, (SELECT COUNT(*) FROM pages p WHERE p.book_id=b.id) AS translated_pages "
+        db.query, "SELECT b.*, "
+                  "(SELECT COUNT(*) FROM pages p WHERE p.book_id=b.id) AS translated_pages, "
+                  "(SELECT COUNT(*) FROM pages p WHERE p.book_id=b.id AND p.status='done') AS done_pages, "
+                  "(SELECT COUNT(*) FROM pages p WHERE p.book_id=b.id AND p.status='failed') AS failed_pages "
                   "FROM books b ORDER BY b.updated_at DESC LIMIT 200")}
 
 

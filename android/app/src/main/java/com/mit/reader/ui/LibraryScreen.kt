@@ -8,13 +8,16 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items as listItems
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Settings
@@ -22,14 +25,18 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -43,6 +50,7 @@ import coil.compose.AsyncImage
 import com.mit.reader.ReaderApp
 import com.mit.reader.data.Book
 import com.mit.reader.data.ReadingMode
+import com.mit.reader.data.ServerBook
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -52,6 +60,9 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
     var books by remember { mutableStateOf<List<Book>>(emptyList()) }
     var refreshing by remember { mutableStateOf(0) }
     var confirmDelete by remember { mutableStateOf<Book?>(null) }
+    var tab by remember { mutableIntStateOf(0) }
+    var serverBooks by remember { mutableStateOf<List<ServerBook>>(emptyList()) }
+    var progressErr by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
 
     val importLauncher = rememberLauncherForActivityResult(
@@ -69,6 +80,15 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
         books = app.library.books()
     }
 
+    // 每次切到「翻译进度」页都拉一次服务端汇总
+    LaunchedEffect(tab) {
+        if (tab == 1) {
+            runCatching { app.api.listBooks() }
+                .onSuccess { serverBooks = it; progressErr = null }
+                .onFailure { progressErr = it.message }
+        }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -84,28 +104,44 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
             }
         },
     ) { pad ->
-        if (books.isEmpty()) {
-            Box(Modifier.fillMaxSize().padding(pad), contentAlignment = Alignment.Center) {
-                Text("点右下角 + 导入 EPUB / MOBI", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Column(Modifier.fillMaxSize().padding(pad)) {
+            TabRow(selectedTabIndex = tab) {
+                Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("书库") })
+                Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("翻译进度") })
             }
-        } else {
-            LazyVerticalGrid(
-                columns = GridCells.Adaptive(120.dp),
-                modifier = Modifier.fillMaxSize().padding(pad),
-                contentPadding = PaddingValues(12.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                items(books, key = { it.id }) { book ->
-                    BookCell(
-                        book = book,
-                        onClick = { onOpen(book.id) },
-                        onLongClick = { confirmDelete = book },
-                        onTranslateAll = { app.startTranslateAll(book) },
-                        isTranslating = app.translatingBookId == book.id,
-                        progressText = if (app.translatingBookId == book.id) app.translatingProgress?.let { "${it.first}/${it.second}" } else null,
-                    )
+            if (tab == 0) {
+                if (books.isEmpty()) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Text("点右下角 + 导入 EPUB / MOBI", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                } else {
+                    LazyVerticalGrid(
+                        columns = GridCells.Adaptive(120.dp),
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        gridItems(books, key = { it.id }) { book ->
+                            BookCell(
+                                book = book,
+                                onClick = { onOpen(book.id) },
+                                onLongClick = { confirmDelete = book },
+                                onTranslateAll = { app.startTranslateAll(book) },
+                                isTranslating = app.translatingBookId == book.id,
+                                progressText = if (app.translatingBookId == book.id) app.translatingProgress?.let { "${it.first}/${it.second}" } else null,
+                            )
+                        }
+                    }
                 }
+            } else {
+                ProgressList(
+                    books = books,
+                    serverBooks = serverBooks,
+                    error = progressErr,
+                    translatingBookId = app.translatingBookId,
+                    translatingProgress = app.translatingProgress,
+                )
             }
         }
     }
@@ -130,6 +166,99 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
                 androidx.compose.material3.TextButton(onClick = { confirmDelete = null }) { Text("取消") }
             },
         )
+    }
+}
+
+/** 翻译进度列表：本地书 + 服务端 done/failed 汇总 + 正在翻译的实时进度。 */
+@Composable
+private fun ProgressList(
+    books: List<Book>,
+    serverBooks: List<ServerBook>,
+    error: String?,
+    translatingBookId: String?,
+    translatingProgress: Pair<Int, Int>?,
+) {
+    if (error != null) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Text("加载进度失败：$error", color = MaterialTheme.colorScheme.error)
+        }
+        return
+    }
+    if (books.isEmpty()) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Text("暂无书籍", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        return
+    }
+    val serverMap = serverBooks.associateBy { it.id }
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        listItems(books, key = { it.id }) { book ->
+            val s = serverMap[book.id]
+            val isRunning = translatingBookId == book.id
+            val done = if (isRunning) (translatingProgress?.first ?: 0) else (s?.donePages ?: 0)
+            val failed = s?.failedPages ?: 0
+            val total = book.pageCount
+            val status = when {
+                isRunning -> "进行中"
+                done + failed == 0 -> "未开始"
+                done >= total && failed == 0 -> "已完成"
+                failed > 0 && done + failed >= total -> "部分失败"
+                else -> "进行中"
+            }
+            BookProgressRow(
+                title = book.title,
+                status = status,
+                done = done,
+                failed = failed,
+                total = total,
+                isRunning = isRunning,
+            )
+        }
+    }
+}
+
+@Composable
+private fun BookProgressRow(
+    title: String,
+    status: String,
+    done: Int,
+    failed: Int,
+    total: Int,
+    isRunning: Boolean,
+) {
+    Column(Modifier.fillMaxWidth()) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text(title, maxLines = 1, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+            Text(
+                status,
+                style = MaterialTheme.typography.labelMedium,
+                color = when (status) {
+                    "已完成" -> MaterialTheme.colorScheme.primary
+                    "进行中" -> MaterialTheme.colorScheme.tertiary
+                    "部分失败" -> MaterialTheme.colorScheme.error
+                    else -> MaterialTheme.colorScheme.onSurfaceVariant
+                },
+            )
+        }
+        Text(
+            buildString {
+                append("$done / $total 页")
+                if (failed > 0) append(" · 失败 $failed")
+                if (isRunning && done < total) append(" · 后台翻译中")
+            },
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (isRunning && total > 0) {
+            LinearProgressIndicator(
+                progress = { done.toFloat() / total.toFloat() },
+                modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+            )
+        }
     }
 }
 
