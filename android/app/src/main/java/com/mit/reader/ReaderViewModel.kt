@@ -9,6 +9,7 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.mit.reader.data.Book
+import com.mit.reader.data.serverId
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
@@ -51,6 +52,22 @@ class ReaderViewModel(private val app: Application) : AndroidViewModel(app) {
             val f = readerApp.library.translatedCacheFile(b.id, i)
             if (f.exists() && f.length() > 0) {
                 pageStates[i] = PageState(status = PageStatus.DONE, translatedFile = f)
+            }
+        }
+        // 已同步到云端的书：后台自动拉最新译文（覆盖本地，别的设备新翻/重翻的页都同步过来）
+        if (b.cloudId != null) refreshFromCloud()
+    }
+
+    /** 同步书：后台从服务端拉全部已翻页（覆盖本地缓存，别的设备新翻/重翻都自动同步）。 */
+    private fun refreshFromCloud() {
+        val b = book ?: return
+        viewModelScope.launch {
+            val doneIdx = readerApp.library.refreshTranslations(b, overwrite = true)
+            for (i in doneIdx) {
+                pageStates[i] = PageState(
+                    status = PageStatus.DONE,
+                    translatedFile = readerApp.library.translatedCacheFile(b.id, i),
+                )
             }
         }
     }
@@ -96,37 +113,37 @@ class ReaderViewModel(private val app: Application) : AndroidViewModel(app) {
 
         viewModelScope.launch {
             try {
-                val resp = readerApp.api.translate(
-                    image = pages[index],
-                    bookId = b.id,
-                    pageIndex = index,
-                    async = true,
-                    force = force,
-                )
-                val pageId: Int
-                if (resp.jobId != null) {
-                    // 轮询 job 直到 done / failed（最多 2 分钟）
-                    var finished = false
-                    var pid = -1
-                    var err: String? = null
-                    var tries = 0
-                    while (!finished && tries < 80) {
-                        val st = readerApp.api.job(resp.jobId)
-                        when (st.status) {
-                            "done" -> { pid = st.pageId ?: -1; finished = true }
-                            "failed" -> { err = st.error ?: "翻译失败"; finished = true }
-                        }
-                        if (!finished) {
-                            delay(1500)
-                            tries++
-                        }
-                    }
-                    if (!finished) err = "超时：翻译未在 2 分钟内完成"
-                    pageId = pid
-                    if (err != null) throw IllegalStateException(err)
+                // 已同步的书：服务端从云端 zip / orig 自取图，不上传图片
+                val jobId = if (b.cloudId != null) {
+                    readerApp.api.translateFromServer(b.serverId, index, force)
                 } else {
-                    pageId = resp.pageId
+                    readerApp.api.translate(
+                        image = pages[index],
+                        bookId = b.serverId,
+                        pageIndex = index,
+                        async = true,
+                        force = force,
+                    ).jobId ?: throw IllegalStateException("无 job_id")
                 }
+                // 轮询 job 直到 done / failed（最多 2 分钟）
+                var finished = false
+                var pid = -1
+                var err: String? = null
+                var tries = 0
+                while (!finished && tries < 80) {
+                    val st = readerApp.api.job(jobId)
+                    when (st.status) {
+                        "done" -> { pid = st.pageId ?: -1; finished = true }
+                        "failed" -> { err = st.error ?: "翻译失败"; finished = true }
+                    }
+                    if (!finished) {
+                        delay(1500)
+                        tries++
+                    }
+                }
+                if (!finished) err = "超时：翻译未在 2 分钟内完成"
+                if (err != null) throw IllegalStateException(err)
+                val pageId = pid
 
                 // 下载译文图 → 本地缓存
                 val out = readerApp.library.translatedCacheFile(b.id, index)

@@ -20,6 +20,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -39,7 +40,27 @@ fun SettingsScreen(onBack: () -> Unit) {
     var url by remember { mutableStateOf(ServerConfig.baseUrl) }
     var key by remember { mutableStateOf(ServerConfig.apiKey) }
     var result by remember { mutableStateOf("") }
+    var usageText by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
+
+    LaunchedEffect(Unit) {
+        val sb = StringBuilder()
+        runCatching { app.api.usage() }
+            .onSuccess { u ->
+                sb.appendLine("用户 ID：${u.userId}")
+                sb.appendLine("Token 消耗：${u.tokenUsed}")
+                sb.appendLine("翻页次数：${u.pageCount}")
+                u.lastActiveAt?.let { sb.appendLine("最后活跃：$it") }
+            }
+            .onFailure { sb.appendLine("用量获取失败：${it.message}") }
+        runCatching { app.api.cloudList() }
+            .onSuccess { list ->
+                val totalBytes = list.sumOf { it.size ?: 0L }
+                sb.appendLine("云端书：${list.size} 本 · 占用 ${formatBytes(totalBytes)}")
+            }
+            .onFailure { sb.appendLine("云端用量获取失败：${it.message}") }
+        usageText = sb.toString().trimEnd()
+    }
 
     Scaffold(
         topBar = {
@@ -66,7 +87,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                 placeholder = { Text("http://192.168.0.90:8020 或 https://mit.example.com") },
             )
             Text(
-                "API Key（鉴权用，与服务端 app.env 的 MIT_API_TOKEN 一致）",
+                "API Key（鉴权 + 云同步账号：与服务端 app.env 的 MIT_API_TOKEN 一致；同一个 Key 多设备互通，不同 Key 互不可见）",
                 style = MaterialTheme.typography.labelMedium,
                 modifier = Modifier.padding(top = 16.dp),
             )
@@ -105,6 +126,27 @@ fun SettingsScreen(onBack: () -> Unit) {
             if (result.isNotBlank()) {
                 Text(result, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 12.dp))
             }
+
+            // ---- 账号用量 ----
+            Text(
+                "账号用量",
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.padding(top = 24.dp),
+            )
+            Text(
+                if (usageText.isBlank()) "加载中…" else usageText,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 8.dp),
+            )
         }
     }
+}
+
+/** 字节数 → 可读大小。 */
+private fun formatBytes(bytes: Long): String = when {
+    bytes >= 1_073_741_824 -> "%.2f GB".format(bytes / 1_073_741_824.0)
+    bytes >= 1_048_576 -> "%.1f MB".format(bytes / 1_048_576.0)
+    bytes >= 1024 -> "%.1f KB".format(bytes / 1024.0)
+    else -> "$bytes B"
 }

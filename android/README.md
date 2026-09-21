@@ -5,21 +5,29 @@
 
 ## 功能
 
-- **书库**：封面网格；右下 `+` 导入 EPUB（复制进 app 专属目录 `filesDir/library/<id>/`，含原 epub + 抽出的页图）。
+- **书库**：封面网格；右下 `+` 导入 EPUB/MOBI（复制进 app 专属目录 `filesDir/library/<id>/`，含原书 + 抽出的页图）。
   长按封面删除：本地文件 + 本地译文缓存 + 服务端该书全部记录一起删。
+- **书库三页签**：`全部 | 本地 | 云端`，每本书左上角带同步状态角标——`仅本地` / `☁✓ 已同步` / `☁ 仅云端`。
+- **云同步**：书菜单「同步到云端」把书打成 zip（book.src + pages + manifest.json，**译文不打进 zip**）传到后端；
+  「取消同步」删云端（含翻译结果）；仅云端书可「下载到本地」还原（页图 + 从服务端拉最新译文 + 所属收藏夹）。
+  导入时按源文件 SHA-256 去重。译文以服务端 `books/pages` 为准，任何设备新翻/重翻都实时落到云端（14 天清理跳过已同步书）。
 - **阅读**：日漫模式右→左横滑，普通模式左→右；顶栏显示 `x / 总数`。
 - **翻译**：底栏「翻译本页」→ 走 `POST /v1/pages/translate?async_mode=1` → 轮询 `GET /v1/jobs/{id}`；
-  完成后译文图下载到本地缓存（`filesDir/translated/<书id>/<页>.png`）。右下角按钮切原图/译文图。
+  完成后译文图下载到本地缓存（`filesDir/translated/<书id>/<页>.webp`）。右下角按钮切原图/译文图；已同步书有「☁ 刷新」按钮拉取别处新翻的页。
 - **自动模式**：顶栏开关，开启后进入阅读器/翻页时预翻「当前页起后 3 页」。
-- **设置**：服务器地址（http/https + 域名 + 端口均可）+ API Key + 测试连接。
+- **设置**：服务器地址（http/https + 域名 + 端口均可）+ API Key（**兼作云同步账号**）+ 测试连接。
 
 ## 后端配合
 
 后端就是仓库里的 `mit-app-api`（端口 8020）。两件事要和 App 对上：
 
-1. **鉴权**：`app.env` 里 `MIT_API_TOKEN` 已填（`aFm7-O4B5VD457MKVDNpDK9QFDkjIHbd`），
-   App 的「设置 → API Key」填同一串。留空则服务端不校验。
-2. **服务器地址**：默认已指向本机 `http://192.168.0.90:8020`（见 `ServerConfig.kt`）。
+1. **鉴权 + 账号**：`app.env` 里 `MIT_API_TOKEN` 已填（`aFm7-O4B5VD457MKVDNpDK9QFDkjIHbd`），
+   App 的「设置 → API Key」填同一串。**API Key 就是账号**：服务端用它的 SHA-256 当 owner——
+   同一个 Key 的多台设备互通，不同 Key 互不可见。留空则服务端不校验（回退单一 `default` 账号）。
+   多账号：把 `MIT_API_TOKEN` 改成逗号分隔的多个 Key，每个 Key 一个账号。
+2. **云同步的翻译永久保留**：已同步的书（`cloud_books`）豁免 14 天清理，书 zip 与翻译结果永久保留；
+   未同步的翻译结果仍按 14 天自动清理。
+3. **服务器地址**：默认已指向本机 `http://192.168.0.90:8020`（见 `ServerConfig.kt`）。
    - 真机与电脑同一局域网即可直连（后端已绑 0.0.0.0；若连不上多半是 **Windows 防火墙**没放行 8020 入站，加一条放行）。
    - 换电脑/端口：App 里「设置」页改。
    - Android **模拟器**：把地址改成 `http://10.0.2.2:8020`（10.0.2.2 = 宿主机）。
@@ -27,7 +35,7 @@
 
 ## 构建运行
 
-**APK 已在本机打好**：`android/app/build/outputs/apk/debug/app-debug.apk`（9.6MB，debug 签名）。
+**APK 已在本机打好**：`android/app/build/outputs/apk/debug/app-debug.apk`（约 10.2MB，debug 签名）。
 直接拷到手机安装即可（手机允许"未知来源安装"）。
 
 **本机命令行重新打包**（已装好工具链在 `D:\android-toolchain` + SDK 在 `D:\android-sdk`）：
@@ -52,9 +60,11 @@ android/app/src/main/java/com/mit/reader/
   MainActivity.kt        入口（Compose）
   ReaderViewModel.kt     阅读态 + 翻译 job 轮询 + 自动预翻
   data/EpubParser.kt     EPUB(spine 顺序)抽图
-  data/LibraryRepository.kt  书库 + 本地译文缓存 + index.json
-  data/TranslationApi.kt app_api 客户端（OkHttp，带 X-API-Token）
-  data/ServerConfig.kt   服务器地址 / API Key（SharedPreferences）
+  data/MobiParser.kt     MOBI/AZW(PDB+PalmDOC)抽图
+  data/Book.kt           Book / Folder / 阅读进度 / serverId(云端书 id)
+  data/LibraryRepository.kt  书库 + 本地译文缓存 + 云同步(zip 打包/下载还原) + index.json
+  data/TranslationApi.kt app_api 客户端（OkHttp，带 X-API-Token + 云接口）
+  data/ServerConfig.kt   服务器地址 / API Key（兼账号，SharedPreferences）
   ui/AppNav.kt           路由
   ui/LibraryScreen.kt    书库
   ui/ReaderScreen.kt     阅读器

@@ -4,6 +4,7 @@
 避免阻塞事件循环。
 """
 
+import hashlib
 import queue
 import threading
 import time
@@ -121,9 +122,93 @@ def init_schema(retries: int = 30, delay: float = 2.0):
                     for t in ("page_blocks", "page_context", "pages", "books"):
                         cur.execute(f"DROP TABLE IF EXISTS {t}")
                     cur.execute("SET FOREIGN_KEY_CHECKS=1")
+                # 5) 多账号改造：books/jobs 补 owner 列（幂等；全新库时表还没建，跳过）
+                for tbl in ("books", "jobs"):
+                    cur.execute(
+                        "SELECT COUNT(*) AS c FROM information_schema.TABLES "
+                        "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s", (tbl,))
+                    if cur.fetchone()["c"] == 0:
+                        continue
+                    cur.execute(
+                        "SELECT COUNT(*) AS c FROM information_schema.COLUMNS "
+                        "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND COLUMN_NAME='owner'",
+                        (tbl,))
+                    if cur.fetchone()["c"] == 0:
+                        cur.execute(
+                            f"ALTER TABLE {tbl} ADD COLUMN owner VARCHAR(191) NOT NULL DEFAULT 'default'")
+                # 6) 旧的 owner='default'（X-User-Id 时代）迁到「单一 API Key 的 SHA-256」；
+                #    多 Key（逗号分隔）时无法判定归属，保持不动；表可能已被后续合并删掉，容错跳过
+                if S.API_TOKEN and "," not in S.API_TOKEN:
+                    new_owner = hashlib.sha256(S.API_TOKEN.encode()).hexdigest()
+                    for tbl in ("cloud_folders", "cloud_books", "books"):
+                        try:
+                            cur.execute(f"UPDATE {tbl} SET owner=%s WHERE owner='default'", (new_owner,))
+                        except Exception:      # noqa: BLE001
+                            pass
                 # ---- 建表（IF NOT EXISTS）----
                 for s in stmts:
                     cur.execute(s)
+                # 7) users 表：把老 owner（sha256 形式）迁成 users.id（幂等）
+                #    迁移后 owner 变成纯数字 users.id，不会再命中下面的 sha256 判断
+                def _looks_sha256(v):
+                    return bool(v) and len(v) == 64 and all(c in "0123456789abcdefABCDEF" for c in v)
+                for tbl in ("cloud_folders", "cloud_books", "books", "jobs"):
+                    try:
+                        cur.execute(f"SELECT DISTINCT owner FROM {tbl}")
+                        owners = [r["owner"] for r in cur.fetchall() if _looks_sha256(r["owner"])]
+                    except Exception:      # noqa: BLE001
+                        owners = []
+                    for o in owners:
+                        cur.execute(
+                            "INSERT INTO users (api_key_hash) VALUES (%s) "
+                            "ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id)", (o,))
+                        cur.execute("SELECT id FROM users WHERE api_key_hash=%s", (o,))
+                        uid = cur.fetchone()["id"]
+                        cur.execute(f"UPDATE {tbl} SET owner=%s WHERE owner=%s", (str(uid), o))
+                # 8) cloud_books 并入 books（单表改造，幂等）
+                #    a. 给 books 补云列
+                cloud_cols = {
+                    "mode": "VARCHAR(16) NULL",
+                    "hash": "VARCHAR(64) NULL",
+                    "fingerprint": "VARCHAR(64) NULL",
+                    "zip_path": "VARCHAR(512) NULL",
+                    "size": "BIGINT NULL",
+                    "folder_id": "BIGINT NULL",
+                    "synced_at": "DATETIME NULL",
+                }
+                for col, ddl in cloud_cols.items():
+                    cur.execute(
+                        "SELECT COUNT(*) AS c FROM information_schema.COLUMNS "
+                        "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='books' AND COLUMN_NAME=%s", (col,))
+                    if cur.fetchone()["c"] == 0:
+                        cur.execute(f"ALTER TABLE books ADD COLUMN {col} {ddl}")
+                #    b. 补 uniq_owner_hash 索引
+                cur.execute(
+                    "SELECT COUNT(*) AS c FROM information_schema.STATISTICS "
+                    "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='books' AND INDEX_NAME='uniq_owner_hash'")
+                if cur.fetchone()["c"] == 0:
+                    cur.execute("ALTER TABLE books ADD UNIQUE KEY uniq_owner_hash (owner, hash)")
+                #    c. 若 cloud_books 仍存在：合并数据后删表
+                cur.execute(
+                    "SELECT COUNT(*) AS c FROM information_schema.TABLES "
+                    "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='cloud_books'")
+                if cur.fetchone()["c"] > 0:
+                    cur.execute(
+                        "INSERT INTO books (id, owner, title, mode, page_count, hash, fingerprint, "
+                        "zip_path, size, folder_id, synced_at) "
+                        "SELECT id, owner, title, mode, page_count, hash, fingerprint, "
+                        "zip_path, size, folder_id, synced_at FROM cloud_books "
+                        "ON DUPLICATE KEY UPDATE mode=VALUES(mode), hash=VALUES(hash), fingerprint=VALUES(fingerprint), "
+                        "zip_path=VALUES(zip_path), size=VALUES(size), folder_id=VALUES(folder_id), synced_at=VALUES(synced_at)")
+                    cur.execute("DROP TABLE IF EXISTS cloud_books")
+                # 9) 把配置的 API Key 种进 users 表（默认用户；幂等）
+                #    支持逗号分隔多 Key：每个 Key 一个用户。启动即存在，不用等首次请求。
+                if S.API_TOKEN:
+                    for token in [t.strip() for t in S.API_TOKEN.split(",") if t.strip()]:
+                        h = hashlib.sha256(token.encode()).hexdigest()
+                        cur.execute(
+                            "INSERT INTO users (api_key_hash) VALUES (%s) "
+                            "ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id)", (h,))
             conn.close()
             return len(stmts)
         except Exception as e:      # noqa: BLE001

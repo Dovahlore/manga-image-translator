@@ -70,3 +70,8 @@ secret.env
 
 # epub 抽页 + 接口测试产物
 /epub_test/
+
+# 测试用漫画素材（几十 MB 起步，不入库）
+/test/*.mobi
+/test/*.epub
+/test/*.zip

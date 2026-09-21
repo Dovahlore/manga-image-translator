@@ -151,6 +151,7 @@ curl -X POST http://127.0.0.1:8020/v1/pages/79/retranslate \
 | `GET /v1/books/{book_id}/pages` | —— | 该书每页的状态/耗时/失败原因 |
 | `DELETE /v1/books/{book_id}` | —— | 删书：级联删页/块/上下文/任务 + 磁盘页文件（App 删书用） |
 | `GET /v1/jobs/{job_id}` | —— | 任务进度：`async_mode=1` 发任务后轮询，`done` 后带 `page_id` |
+| `GET /v1/usage` | —— | 当前账号用量：`user_id` + `{token_used, page_count, last_active_at}` |
 
 ```bash
 curl -X POST http://127.0.0.1:8020/v1/books -H "Content-Type: application/json" \
@@ -161,7 +162,24 @@ curl http://127.0.0.1:8020/v1/books/demo-book/pages
 
 ---
 
-## 5. 引擎侧（8010，排查用，App 正常不用直接调）
+## 5. 云同步（/v1/cloud/*，多账号按 API Key 隔离）
+
+| 请求 | Body/参数 | 说明 |
+|---|---|---|
+| `POST /v1/cloud/books` | multipart：`file`(zip) + `title`/`folder`/`mode`/`hash`/`fingerprint`/`page_count` | 同步一本书；同账号同 `hash` 去重，返回已存在 id |
+| `GET /v1/cloud/books` | —— | 云端书列表（含 folder / hash / size） |
+| `GET /v1/cloud/books/lookup?hash=…` | —— | 按 hash 查是否已同步 |
+| `GET /v1/cloud/books/{id}/download` | —— | 下载 zip |
+| `DELETE /v1/cloud/books/{id}` | —— | 取消同步：删 zip + 记录 + 它的翻译结果（级联） |
+| `GET/POST/DELETE /v1/cloud/folders[/{id}]` | `{"name":…}` | 收藏夹增删查（删夹不解散书，只解除归属） |
+
+> 所有 `/v1/*` 都要 `X-API-Token`（**API Key 即账号**：服务端用 `users.api_key_hash = SHA-256(Key)` 找用户，
+> 各表 `owner` 存 `users.id`；同一个 Key 多设备互通，不同 Key 互不可见）。`MIT_API_TOKEN` 支持逗号分隔多 Key。
+> 云端书与其翻译结果**永久保留**（14 天自动清理会跳过已同步书），只有取消同步才删。
+
+---
+
+## 6. 引擎侧（8010，排查用，App 正常不用直接调）
 
 | 请求 | 说明 |
 |---|---|

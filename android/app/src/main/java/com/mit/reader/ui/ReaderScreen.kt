@@ -122,8 +122,9 @@ fun ReaderScreen(bookId: String, onBack: () -> Unit) {
             modifier = Modifier.fillMaxSize(),
         ) { i ->
             val pageState = vm.pageStates[i]
-            // 该页已翻好时默认展示译文；单击图片切换原图
-            val show = i == vm.currentPage && pageState?.status == PageStatus.DONE && !vm.showOriginal
+            // 已翻好的页直接展示译文（翻页不再先闪一下原图）；仅「当前页 + 手动切原图」时显示原图
+            val show = pageState?.status == PageStatus.DONE &&
+                !(i == vm.currentPage && vm.showOriginal)
             val file = if (show) pageState?.translatedFile else book.pageFiles[i]
             ZoomableImage(
                 model = file,

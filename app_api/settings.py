@@ -22,6 +22,7 @@ REDIS_PASSWORD = os.getenv("MIT_REDIS_PASSWORD", "").strip()
 DATA_DIR = Path(os.getenv("MIT_DATA_DIR", "/data"))
 CACHE_DIR = DATA_DIR / "cache" / "result"
 BOOKS_DIR = DATA_DIR / "books"
+CLOUD_DIR = DATA_DIR / "cloud"          # 云端同步的书 zip
 
 # 访问令牌：留空=不校验（仅内网自用时可以留空）
 API_TOKEN = os.getenv("MIT_API_TOKEN", "").strip()

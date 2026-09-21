@@ -4,7 +4,10 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.asRequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
+import okio.BufferedSink
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -19,6 +22,24 @@ data class ServerBook(
     val pageCount: Int?,
     val donePages: Int,
     val failedPages: Int,
+)
+data class CloudUploadResp(val bookId: String, val existed: Boolean)
+data class CloudBook(
+    val id: String,
+    val title: String?,
+    val mode: String,
+    val pageCount: Int?,
+    val hash: String?,
+    val fingerprint: String?,
+    val size: Long?,
+    val folder: String?,
+)
+data class CloudFolder(val id: Int, val name: String, val bookCount: Int)
+data class UsageInfo(
+    val userId: String,
+    val tokenUsed: Long,
+    val pageCount: Int,
+    val lastActiveAt: String?,
 )
 
 /**
@@ -36,7 +57,9 @@ class TranslationApi {
     private val base get() = ServerConfig.baseUrl
 
     private fun Request.Builder.authed(): Request.Builder =
-        apply { ServerConfig.apiKey.takeIf { it.isNotBlank() }?.let { header("X-API-Token", it) } }
+        apply {
+            ServerConfig.apiKey.takeIf { it.isNotBlank() }?.let { header("X-API-Token", it) }
+        }
 
     /** 上传一页翻译。async=true 立刻拿 jobId 去轮询；false 同步等结果（慢）。 */
     suspend fun translate(image: File, bookId: String, pageIndex: Int, async: Boolean, force: Boolean = false): TranslateResp =
@@ -119,7 +142,7 @@ class TranslationApi {
             }
         }
 
-    /** 全书翻译：一次把若干页图传上去，服务端按顺序后台跑（返回后轮询 bookPages 看进度）。 */
+    /** 全书翻译：一次把若干页图传上去，服务端按顺序后台跑。返回 book_job_id（停止用）。 */
     suspend fun translateAll(
         bookId: String,
         title: String?,
@@ -127,7 +150,7 @@ class TranslationApi {
         pageCount: Int,
         pageIndices: List<Int>,
         images: List<File>,
-    ) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+    ): String = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
         val builder = MultipartBody.Builder().setType(MultipartBody.FORM)
             .addFormDataPart("book_id", bookId)
             .addFormDataPart("page_count", pageCount.toString())
@@ -141,12 +164,75 @@ class TranslationApi {
         client.newCall(req).execute().use { resp ->
             val text = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code}: ${text.take(300)}")
+            JSONObject(text).optString("book_job_id").takeIf { it.isNotEmpty() }
+                ?: throw IllegalStateException("无 book_job_id")
         }
     }
+
+    /** 全书翻译（服务端自取图）：已同步的书从云端 zip 取图，不上传页图。返回 book_job_id。 */
+    suspend fun translateAllFromZip(
+        bookId: String,
+        title: String?,
+        orderDir: String?,
+        pageIndices: List<Int>,
+        force: Boolean = false,
+    ): String = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+            .addFormDataPart("page_indices", JSONArray(pageIndices).toString())
+        title?.takeIf { it.isNotBlank() }?.let { body.addFormDataPart("title", it) }
+        orderDir?.let { body.addFormDataPart("order_dir", it) }
+        if (force) body.addFormDataPart("force", "true")
+        val req = Request.Builder().url("$base/v1/books/$bookId/translate-from-zip").authed().post(body.build()).build()
+        client.newCall(req).execute().use { resp ->
+            val text = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code}: ${text.take(300)}")
+            JSONObject(text).optString("book_job_id").takeIf { it.isNotEmpty() }
+                ?: throw IllegalStateException("无 book_job_id")
+        }
+    }
+
+    /** 取消服务端后台任务（停止全书翻译）。 */
+    suspend fun cancelJob(jobId: String): Boolean =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val req = Request.Builder().url("$base/v1/jobs/$jobId/cancel").authed()
+                .post(ByteArray(0).toRequestBody(null)).build()
+            client.newCall(req).execute().use { it.isSuccessful }
+        }
+
+    /** 单页翻译（服务端自取图）：已同步的书不上传图片，返回 jobId 轮询。 */
+    suspend fun translateFromServer(bookId: String, pageIndex: Int, force: Boolean = false): String =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+            if (force) body.addFormDataPart("force", "true")
+            val req = Request.Builder().url("$base/v1/books/$bookId/pages/$pageIndex/translate").authed().post(body.build()).build()
+            client.newCall(req).execute().use { resp ->
+                val text = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code}: ${text.take(300)}")
+                JSONObject(text).optString("job_id").takeIf { it.isNotEmpty() }
+                    ?: throw IllegalStateException("无 job_id")
+            }
+        }
 
     suspend fun deleteBook(bookId: String): Boolean = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
         val req = Request.Builder().url("$base/v1/books/$bookId").authed().delete().build()
         client.newCall(req).execute().use { it.isSuccessful }
+    }
+
+    /** 当前账号用量：token / 翻页数 / 最后活跃时间。 */
+    suspend fun usage(): UsageInfo = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        val req = Request.Builder().url("$base/v1/usage").authed().build()
+        client.newCall(req).execute().use { resp ->
+            val text = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code}: ${text.take(200)}")
+            val j = JSONObject(text)
+            val u = j.optJSONObject("usage")
+            UsageInfo(
+                userId = j.optString("user_id", ""),
+                tokenUsed = u?.optLong("token_used", 0) ?: 0L,
+                pageCount = u?.optInt("page_count", 0) ?: 0,
+                lastActiveAt = u?.optString("last_active_at")?.takeIf { it.isNotBlank() },
+            )
+        }
     }
 
     /** 测连通：GET /v1/health，返回状态说明。 */
@@ -160,15 +246,142 @@ class TranslationApi {
         }.getOrElse { "连接失败: ${it.message}" }
     }
 
+    // ---------------------------------------------------------------- 云同步
+
+    /** 同步一本本地书：上传 zip（book.src + pages + translated + manifest），按 owner+hash 去重。
+     *  onProgress: (已上传字节, 总字节)。 */
+    suspend fun cloudUpload(
+        zip: File,
+        title: String?,
+        folder: String?,
+        mode: String,
+        hash: String,
+        fingerprint: String?,
+        pageCount: Int,
+        oldBookId: String? = null,
+        onProgress: ((Long, Long) -> Unit)? = null,
+    ): CloudUploadResp = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        val total = zip.length()
+        val fileBody = object : RequestBody() {
+            override fun contentType() = "application/zip".toMediaType()
+            override fun contentLength() = total
+            override fun writeTo(sink: BufferedSink) {
+                val buf = ByteArray(64 * 1024)
+                zip.inputStream().use { ins ->
+                    var sent = 0L
+                    while (true) {
+                        val n = ins.read(buf)
+                        if (n <= 0) break
+                        sink.write(buf, 0, n)
+                        sent += n
+                        onProgress?.invoke(sent, total)
+                    }
+                }
+            }
+        }
+        val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+            .addFormDataPart("file", zip.name, fileBody)
+            .addFormDataPart("hash", hash)
+            .addFormDataPart("mode", mode)
+            .addFormDataPart("page_count", pageCount.toString())
+        title?.takeIf { it.isNotBlank() }?.let { body.addFormDataPart("title", it) }
+        folder?.takeIf { it.isNotBlank() }?.let { body.addFormDataPart("folder", it) }
+        fingerprint?.takeIf { it.isNotBlank() }?.let { body.addFormDataPart("fingerprint", it) }
+        oldBookId?.takeIf { it.isNotBlank() }?.let { body.addFormDataPart("old_book_id", it) }
+        val req = Request.Builder().url("$base/v1/cloud/books").authed().post(body.build()).build()
+        client.newCall(req).execute().use { resp ->
+            val text = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code}: ${text.take(300)}")
+            val j = JSONObject(text)
+            CloudUploadResp(j.getString("book_id"), j.optBoolean("existed", false))
+        }
+    }
+
+    /** 拉当前账号的云端书列表。 */
+    suspend fun cloudList(): List<CloudBook> = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        val req = Request.Builder().url("$base/v1/cloud/books").authed().build()
+        client.newCall(req).execute().use { resp ->
+            val text = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code}: ${text.take(200)}")
+            val arr = JSONObject(text).optJSONArray("books") ?: JSONArray()
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                CloudBook(
+                    id = o.getString("id"),
+                    title = o.optString("title").takeIf { it.isNotBlank() },
+                    mode = o.optString("mode", "manga"),
+                    pageCount = if (o.isNull("page_count")) null else o.optInt("page_count"),
+                    hash = o.optString("hash").takeIf { it.isNotBlank() },
+                    fingerprint = o.optString("fingerprint").takeIf { it.isNotBlank() },
+                    size = if (o.isNull("size")) null else o.optLong("size"),
+                    folder = o.optString("folder").takeIf { it.isNotBlank() },
+                )
+            }
+        }
+    }
+
+    /** 云端文件夹列表（同步时的 folder 名会在此体现）。 */
+    suspend fun cloudFolders(): List<CloudFolder> = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        val req = Request.Builder().url("$base/v1/cloud/folders").authed().build()
+        client.newCall(req).execute().use { resp ->
+            val text = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code}: ${text.take(200)}")
+            val arr = JSONObject(text).optJSONArray("folders") ?: JSONArray()
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                CloudFolder(o.getInt("id"), o.optString("name", "未命名"), o.optInt("book_count", 0))
+            }
+        }
+    }
+
+    /** 下载云端书 zip（还原到本地用）。onProgress: (已下载字节, 总字节)。 */
+    suspend fun cloudDownload(cloudId: String, out: File, onProgress: ((Long, Long) -> Unit)? = null) =
+        download("$base/v1/cloud/books/$cloudId/download", out, onProgress)
+
+    /** 云端书封面 URL / 下载（未下载本地时也能显示封面）。 */
+    fun cloudCoverUrl(cloudId: String) = "$base/v1/cloud/books/$cloudId/cover"
+    suspend fun cloudDownloadCover(cloudId: String, out: File) =
+        download(cloudCoverUrl(cloudId), out)
+
+    /** 更新云端书归属收藏夹（folder=null 或空 = 移出未分类）。 */
+    suspend fun cloudUpdateFolder(cloudId: String, folder: String?): Boolean =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val body = JSONObject().put("folder", folder ?: "").toString()
+                .toRequestBody("application/json".toMediaType())
+            val req = Request.Builder().url("$base/v1/cloud/books/$cloudId/folder").authed().post(body).build()
+            client.newCall(req).execute().use { it.isSuccessful }
+        }
+
+    /** 取消同步：删云端 zip + 记录 + 它的翻译结果（服务端级联）。 */
+    suspend fun cloudDelete(cloudId: String): Boolean =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val req = Request.Builder().url("$base/v1/cloud/books/$cloudId").authed().delete().build()
+            client.newCall(req).execute().use { it.isSuccessful }
+        }
+
     fun translatedUrl(pageId: Int) = "$base/v1/pages/$pageId/image"
     fun originalUrl(pageId: Int) = "$base/v1/pages/$pageId/image?orig=1"
 
-    suspend fun download(url: String, out: File) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-        val req = Request.Builder().url(url).authed().build()
-        client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code}")
-            resp.body?.byteStream()?.use { it.copyTo(out.outputStream()) }
-                ?: throw IllegalStateException("空响应")
+    suspend fun download(url: String, out: File, onProgress: ((Long, Long) -> Unit)? = null) =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val req = Request.Builder().url(url).authed().build()
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code}")
+                val body = resp.body ?: throw IllegalStateException("空响应")
+                val total = body.contentLength()
+                body.byteStream().use { ins ->
+                    out.outputStream().use { os ->
+                        val buf = ByteArray(64 * 1024)
+                        var written = 0L
+                        while (true) {
+                            val n = ins.read(buf)
+                            if (n <= 0) break
+                            os.write(buf, 0, n)
+                            written += n
+                            onProgress?.invoke(written, total)
+                        }
+                    }
+                }
+            }
         }
-    }
 }

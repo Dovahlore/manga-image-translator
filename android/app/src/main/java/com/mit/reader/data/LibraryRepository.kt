@@ -8,13 +8,19 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.security.MessageDigest
 import java.util.UUID
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
+import java.util.zip.ZipOutputStream
 
 class LibraryRepository(private val context: Context) {
     private val root = File(context.filesDir, "library").apply { mkdirs() }
     private val indexFile = File(root, "index.json")
     private val translatedRoot = File(context.filesDir, "translated").apply { mkdirs() }
+    private val cloudCovers = File(context.filesDir, "cloud_covers").apply { mkdirs() }
     private val progressPrefs = context.getSharedPreferences("reading_progress", Context.MODE_PRIVATE)
+    private val api = TranslationApi()
 
     private data class IndexData(val books: List<Book>, val folders: List<Folder>)
 
@@ -38,8 +44,25 @@ class LibraryRepository(private val context: Context) {
             "mobi" -> MobiParser.extract(src, dir)
             else -> EpubParser.extract(src, dir)
         }
-        val book = Book(id, fromName.ifBlank { r.title }, ReadingMode.MANGA, r.pages.size, r.pages.first(), r.pages)
+        val hash = sha256(src)
+        val fp = fingerprint(r.pages)
         val d = readIndexData()
+        // 去重：同样源文件哈希的书已存在 → 直接返回已存在的那本，删掉刚导入的副本
+        d.books.firstOrNull { it.hash.isNotEmpty() && it.hash == hash }?.let { existing ->
+            dir.deleteRecursively()
+            return@withContext existing
+        }
+        val book = Book(
+            id = id,
+            title = fromName.ifBlank { r.title },
+            mode = ReadingMode.MANGA,
+            pageCount = r.pages.size,
+            coverFile = r.pages.first(),
+            pageFiles = r.pages,
+            hash = hash,
+            fingerprint = fp,
+            createdAt = System.currentTimeMillis(),
+        )
         writeIndex(d.books + book, d.folders)
         book
     }
@@ -103,7 +126,12 @@ class LibraryRepository(private val context: Context) {
 
     suspend fun renameFolder(id: String, name: String) = withContext(Dispatchers.IO) {
         val d = readIndexData()
-        writeIndex(d.books, d.folders.map { if (it.id == id) it.copy(name = name.trim()) else it })
+        val newName = name.trim()
+        writeIndex(d.books, d.folders.map { if (it.id == id) it.copy(name = newName) else it })
+        // 已同步书：该夹下所有同步书的云端 folder 名跟着改
+        for (b in d.books) {
+            if (b.folderId == id && b.cloudId != null) runCatching { api.cloudUpdateFolder(b.cloudId, newName) }
+        }
     }
 
     suspend fun deleteFolder(id: String) = withContext(Dispatchers.IO) {
@@ -112,12 +140,22 @@ class LibraryRepository(private val context: Context) {
             d.books.map { if (it.folderId == id) it.copy(folderId = null) else it },
             d.folders.filterNot { it.id == id },
         )
+        // 已同步书：该夹下同步书移出未分类
+        for (b in d.books) {
+            if (b.folderId == id && b.cloudId != null) runCatching { api.cloudUpdateFolder(b.cloudId, null) }
+        }
     }
 
     /** 把书移进/移出收藏夹。folderId 传 null 表示移到「未分类」。 */
     suspend fun moveBook(bookId: String, folderId: String?) = withContext(Dispatchers.IO) {
         val d = readIndexData()
         writeIndex(d.books.map { if (it.id == bookId) it.copy(folderId = folderId) else it }, d.folders)
+        // 已同步的书：收藏夹变化同步到云端
+        val book = d.books.find { it.id == bookId } ?: return@withContext
+        if (book.cloudId != null) {
+            val name = folderId?.let { fid -> d.folders.find { it.id == fid }?.name }
+            runCatching { api.cloudUpdateFolder(book.cloudId, name) }
+        }
     }
 
     /** 重命名书名（空白则忽略）。 */
@@ -126,6 +164,199 @@ class LibraryRepository(private val context: Context) {
         if (t.isBlank()) return@withContext
         val d = readIndexData()
         writeIndex(d.books.map { if (it.id == bookId) it.copy(title = t) else it }, d.folders)
+    }
+
+    // ---------------------------------------------------------------- 云同步
+
+    /** 同步一本本地书：打包 zip → 上传 → 记录 cloudId。返回更新后的书。
+     *  onProgress(阶段文案, 0..1 进度；null=不确定)。 */
+    suspend fun sync(book: Book, onProgress: ((String, Float?) -> Unit)? = null): Book = withContext(Dispatchers.IO) {
+        onProgress?.invoke("打包中…", null)
+        val zipFile = File(context.cacheDir, "sync-${book.id}.zip")
+        if (zipFile.exists()) zipFile.delete()
+        packBook(book, zipFile)
+        val folderName = book.folderId?.let { fid -> readIndexData().folders.find { it.id == fid }?.name }
+        val resp = api.cloudUpload(
+            zip = zipFile,
+            title = book.title,
+            folder = folderName,
+            mode = if (book.mode == ReadingMode.NORMAL) "normal" else "manga",
+            hash = book.hash.ifBlank { sha256(epubFile(book.id)) },
+            fingerprint = book.fingerprint,
+            pageCount = book.pageCount,
+            oldBookId = book.id,   // 先翻译后同步：把本地 UUID 下的旧译文迁到 cloudId
+            onProgress = { sent, total -> onProgress?.invoke("上传中…", if (total > 0) sent.toFloat() / total else null) },
+        )
+        zipFile.delete()
+        // 缓存封面：删本地后云端 tab 仍能显示封面
+        runCatching { book.coverFile.copyTo(cloudCoverFile(resp.bookId), overwrite = true) }
+        val d = readIndexData()
+        writeIndex(d.books.map { if (it.id == book.id) it.copy(cloudId = resp.bookId) else it }, d.folders)
+        readIndexData().books.find { it.id == book.id } ?: book
+    }
+
+    /** 取消同步：删云端（含翻译结果），本地保留，清空 cloudId。 */
+    suspend fun cancelSync(book: Book): Book = withContext(Dispatchers.IO) {
+        book.cloudId?.let {
+            runCatching { api.cloudDelete(it) }
+            cloudCoverFile(it).delete()
+        }
+        val d = readIndexData()
+        writeIndex(d.books.map { if (it.id == book.id) it.copy(cloudId = null) else it }, d.folders)
+        readIndexData().books.find { it.id == book.id } ?: book
+    }
+
+    /** 从云端下载一本书并还原到本地（页面 + 译文缓存 + 归属文件夹），cloudId 保持云端 id。
+     *  onProgress(阶段文案, 0..1 进度；null=不确定)。 */
+    suspend fun downloadCloud(cloud: CloudBook, onProgress: ((String, Float?) -> Unit)? = null): Book = withContext(Dispatchers.IO) {
+        val id = UUID.randomUUID().toString()
+        val dir = File(root, id).apply { mkdirs() }
+        val zipFile = File(context.cacheDir, "dl-${cloud.id}.zip")
+        if (zipFile.exists()) zipFile.delete()
+        api.cloudDownload(cloud.id, zipFile) { got, total ->
+            onProgress?.invoke("下载中…", if (total > 0) got.toFloat() / total else null)
+        }
+        onProgress?.invoke("还原中…", null)
+
+        var title = cloud.title
+        var mode = ReadingMode.MANGA
+        var folderName: String? = cloud.folder
+        val pagesDir = File(dir, "pages").apply { mkdirs() }
+        val translatedDir = File(translatedRoot, id).apply { mkdirs() }
+
+        ZipFile(zipFile).use { zip ->
+            zip.getEntry("manifest.json")?.let { e ->
+                val m = JSONObject(zip.getInputStream(e).bufferedReader(Charsets.UTF_8).readText())
+                title = m.optString("title").takeIf { it.isNotBlank() } ?: title
+                mode = if (m.optString("mode") == "normal") ReadingMode.NORMAL else ReadingMode.MANGA
+                folderName = m.optString("folder").takeIf { it.isNotBlank() } ?: folderName
+            }
+            for (e in zip.entries()) {
+                if (e.isDirectory) continue
+                val name = e.name
+                when {
+                    name == "book.src" ->
+                        zip.getInputStream(e).use { it.copyTo(File(dir, "book.src").outputStream()) }
+                    name.startsWith("pages/") ->
+                        zip.getInputStream(e).use { it.copyTo(File(pagesDir, name.substringAfterLast('/')).outputStream()) }
+                    name.startsWith("translated/") ->
+                        zip.getInputStream(e).use { it.copyTo(File(translatedDir, name.substringAfterLast('/')).outputStream()) }
+                }
+            }
+        }
+        zipFile.delete()
+
+        val pages = pagesDir.listFiles { f -> f.isFile }?.sortedBy { it.name } ?: emptyList()
+        if (pages.isEmpty()) throw IllegalStateException("云端书 zip 里没有页面")
+
+        val srcFile = File(dir, "book.src")
+        val hash = if (srcFile.exists()) sha256(srcFile) else (cloud.hash ?: "")
+        val fp = if (pages.isNotEmpty()) fingerprint(pages) else ""
+
+        val d = readIndexData()
+        var folders = d.folders
+        var folderId: String? = null
+        if (!folderName.isNullOrBlank()) {
+            folderId = folders.find { it.name == folderName }?.id
+            if (folderId == null) {
+                val f = Folder(UUID.randomUUID().toString(), folderName)
+                folders = folders + f
+                folderId = f.id
+            }
+        }
+        val book = Book(
+            id = id,
+            title = title ?: "未命名",
+            mode = mode,
+            pageCount = pages.size,
+            coverFile = pages.first(),
+            pageFiles = pages,
+            folderId = folderId,
+            cloudId = cloud.id,
+            hash = hash,
+            fingerprint = fp,
+        )
+
+        // 译文不打进 zip：直接从服务端拉最新结果（云端书永久保留，bookPages 永远查得到）。
+        // 这样别的设备新翻/重翻的页，下载到本机时拿到的就是最新的译文。
+        runCatching { api.bookPages(cloud.id) }.getOrNull()?.forEach { p ->
+            if (p.status == "done" && p.pageIndex in pages.indices) {
+                val f = translatedCacheFile(id, p.pageIndex)
+                f.parentFile?.mkdirs()
+                runCatching { api.download(api.translatedUrl(p.id), f) }
+            }
+        }
+
+        // 缓存封面
+        runCatching { pages.first().copyTo(cloudCoverFile(cloud.id), overwrite = true) }
+
+        writeIndex(d.books + book, folders)
+        book
+    }
+
+    /** 从服务端拉该书已翻好的页到本地译文缓存。
+     *  overwrite=true 覆盖本地旧译文（别的设备重翻后同步）；false 只补缺失的（后台静默用）。返回已就绪页索引。 */
+    suspend fun refreshTranslations(book: Book, overwrite: Boolean): Set<Int> = withContext(Dispatchers.IO) {
+        val done = mutableSetOf<Int>()
+        val pages = runCatching { api.bookPages(book.serverId) }.getOrNull() ?: return@withContext done
+        for (p in pages) {
+            if (p.status != "done" || p.pageIndex !in book.pageFiles.indices) continue
+            val f = translatedCacheFile(book.id, p.pageIndex)
+            if (!overwrite && f.exists() && f.length() > 0L) { done += p.pageIndex; continue }
+            f.parentFile?.mkdirs()
+            runCatching { api.download(api.translatedUrl(p.id), f) }.onSuccess { done += p.pageIndex }
+        }
+        done
+    }
+
+    /** 打包：book.src + pages 目录 + manifest.json（译文不打进 zip，直接从服务端拉最新）。 */
+    private fun packBook(book: Book, zipFile: File) {
+        ZipOutputStream(zipFile.outputStream().buffered()).use { zos ->
+            fun add(name: String, file: File) {
+                if (!file.exists()) return
+                zos.putNextEntry(ZipEntry(name))
+                file.inputStream().use { it.copyTo(zos) }
+                zos.closeEntry()
+            }
+            val manifest = JSONObject().apply {
+                put("title", book.title)
+                put("mode", if (book.mode == ReadingMode.NORMAL) "normal" else "manga")
+                put("page_count", book.pageCount)
+                put("hash", book.hash)
+                put("fingerprint", book.fingerprint)
+            }
+            zos.putNextEntry(ZipEntry("manifest.json"))
+            zos.write(manifest.toString().toByteArray(Charsets.UTF_8))
+            zos.closeEntry()
+            add("book.src", epubFile(book.id))
+            for (f in book.pageFiles) add("pages/${f.name}", f)
+        }
+    }
+
+    private fun sha256(f: File): String {
+        if (!f.exists()) return ""
+        val md = MessageDigest.getInstance("SHA-256")
+        f.inputStream().use { ins ->
+            val buf = ByteArray(64 * 1024)
+            while (true) {
+                val n = ins.read(buf)
+                if (n <= 0) break
+                md.update(buf, 0, n)
+            }
+        }
+        return md.digest().joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+    }
+
+    private fun fingerprint(pages: List<File>): String {
+        val cover = pages.firstOrNull() ?: return ""
+        val md = MessageDigest.getInstance("SHA-256")
+        md.update(pages.size.toString().toByteArray(Charsets.UTF_8))
+        cover.inputStream().use { ins ->
+            val buf = ByteArray(64 * 1024)
+            val n = ins.read(buf)
+            if (n > 0) md.update(buf, 0, n)
+        }
+        return md.digest().joinToString("") { "%02x".format(it.toInt() and 0xFF) }
     }
 
     // ---------------------------------------------------------------- 阅读进度
@@ -159,6 +390,17 @@ class LibraryRepository(private val context: Context) {
         File(File(translatedRoot, bookId), pageIndex.toString().padStart(3, '0') + ".webp")
 
     fun epubFile(bookId: String): File = File(File(root, bookId), "book.src")
+
+    /** 云端书封面缓存文件（删本地后云端 tab 仍能显示封面）。 */
+    fun cloudCoverFile(cloudId: String): File = File(cloudCovers, "$cloudId.jpg")
+
+    /** 确保云端书封面已缓存（没有就从服务端拉）。 */
+    suspend fun ensureCloudCover(cloudId: String) = withContext(Dispatchers.IO) {
+        val f = cloudCoverFile(cloudId)
+        if (f.exists() && f.length() > 0L) return@withContext
+        f.parentFile?.mkdirs()
+        runCatching { api.cloudDownloadCover(cloudId, f) }.onFailure { f.delete() }
+    }
 
     // ---------------------------------------------------------------- index 持久化
 
@@ -194,6 +436,10 @@ class LibraryRepository(private val context: Context) {
                 coverFile = pages.first(),
                 pageFiles = pages,
                 folderId = if (o.isNull("folder_id")) null else o.optString("folder_id").takeIf { it.isNotBlank() },
+                cloudId = if (o.isNull("cloud_id")) null else o.optString("cloud_id").takeIf { it.isNotBlank() },
+                hash = o.optString("hash", ""),
+                fingerprint = o.optString("fingerprint", ""),
+                createdAt = o.optLong("created_at", 0L),
             )
         }
         return out
@@ -208,6 +454,10 @@ class LibraryRepository(private val context: Context) {
                 put("title", b.title)
                 put("mode", if (b.mode == ReadingMode.NORMAL) "normal" else "manga")
                 b.folderId?.let { put("folder_id", it) }
+                b.cloudId?.let { put("cloud_id", it) }
+                if (b.hash.isNotEmpty()) put("hash", b.hash)
+                if (b.fingerprint.isNotEmpty()) put("fingerprint", b.fingerprint)
+                put("created_at", b.createdAt)
             })
         }
         obj.put("books", barr)

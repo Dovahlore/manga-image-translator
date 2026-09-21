@@ -1,7 +1,7 @@
 # 项目状态（压缩交接文档）
 
 > 用途：替代长对话上下文。新会话直接读本文件即可继续，不必回溯历史。
-> 最后更新：2026-09-18（本文件由会话压缩生成；同日补充 §4/§6/§8/§9 的「接口测试轮」结果）
+> 最后更新：2026-09-21（云同步前后端全部落地 + Android 重打包）
 
 ## 1. 目标
 
@@ -58,13 +58,17 @@ python devscripts\epub_translate_test.py --pages 10,20 --book-id x   # 走 App �
 python devscripts\analyze_font_size.py    # 逐块量「渲染字号 / 原文字号」，找字超大的块
 python devscripts\make_test_image.py      # 重新生成 _runtime\work\input\test_page.png
 python devscripts\app_contract_test.py    # 模拟 Android App 的完整调用序列（鉴权/async job 轮询/下载/删书）
+python devscripts\cloud_contract_test.py  # 云同步接口 8 项（上传/列表/查重/下载/收藏夹/账号隔离/取消同步级联）
+python devscripts\owner_isolation_test.py KEY_A KEY_B   # 多账号隔离 15 项（两账号同书/books/pages/cloud 互不可见）
 python devscripts\cleanup_test_artifacts.py [--apply]   # 清测试书桶 + 占位符缓存（含 MySQL 行）
 ```
 - 引擎重建：`.\mit-app.ps1 build`（走 compose）或 `.\mit-docker.ps1 build -BaseImage docker.m.daocloud.io/pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime`
 - 文档：`DOCKER_SETUP.md`、`app_api/API.md`、`android/README.md`
-- **Android 阅读器 App**（`android/`，Kotlin + Compose）：书库/封面/导入、日漫 RTL+普通 LTR 阅读、
-  每页翻译(job 轮询)、右下角切原/译文、自动预翻后 3 页、设置页(地址+API Key)、删书端到端。
-  后端就是本仓库 app_api(8020)，`MIT_API_TOKEN` 鉴权 + 14 天保留。用 Android Studio 打开 `android/` 构建
+- **Android 阅读器 App**（`android/`，Kotlin + Compose）：书库/封面/导入(EPUB+MOBI)、日漫 RTL+普通 LTR 阅读、
+  每页翻译(job 轮询)、右下角切原/译文、自动预翻后 3 页、设置页(地址+API Key=账号)、删书端到端。
+  **云同步**：书库三页签 `全部|本地|云端` + 三态角标（仅本地 / ☁✓ 已同步 / ☁ 仅云端）；
+  「同步到云端」打 zip 上传、「取消同步」删云端、「下载到本地」还原（含译文缓存与收藏夹）、导入按 SHA-256 去重。
+  后端就是本仓库 app_api(8020)，`MIT_API_TOKEN` 鉴权 + 14 天保留（云端书永久）。用 Android Studio 打开 `android/` 构建
 
 ## 4. 已打的上游补丁（都在工作区，**未提交**）
 
@@ -111,9 +115,20 @@ GET  /v1/pages/{id}/json                     # 结构化结果
 POST /v1/pages/{id}/retranslate              # 重译：{"config":{...},"context":[...],"force":true}
 POST /v1/books  、GET /v1/books  、GET /v1/books/{id}/pages 、DELETE /v1/books/{id}  # 删书=级联删+清磁盘
 GET  /v1/health  、GET /v1/capabilities      # 后者含可用翻译器/默认配置
+
+# —— 云同步（账号 = API Key → users.id；未配 Key 时 'default'；书 zip + 翻译结果永久保留）——
+POST   /v1/cloud/books             # multipart: file(zip) + hash(必填) + title/folder/mode/fingerprint/page_count
+                                   #   按 owner+hash 去重：已存在直接返回原 id（existed=true）
+GET    /v1/cloud/books             # 当前账号云端书列表（id/title/mode/page_count/hash/folder/...）
+GET    /v1/cloud/books/lookup?hash=...   # 查重：{book_id, existed, title}
+GET    /v1/cloud/books/{id}/download     # 下云端 zip（book.src + pages + translated + manifest.json）
+DELETE /v1/cloud/books/{id}             # 取消同步：删 zip + 记录 + 翻译结果（books 级联）+ 磁盘
+GET    /v1/cloud/folders 、POST /v1/cloud/folders 、DELETE /v1/cloud/folders/{id}
 ```
 - **鉴权已开**：`/v1/*` 都要 `X-API-Token`（= `app.env` 的 `MIT_API_TOKEN`，当前 `aFm7-O4B5VD457MKVDNpDK9QFDkjIHbd`），带错→401；关掉就把 app.env 里留空并重启
-- **保留期**：翻译结果（pages/块/上下文 + 磁盘图片与 L1 缓存）超 `MIT_RETENTION_DAYS`（默认 14 天）自动清理；App 本地有译文缓存
+- **保留期**：翻译结果（pages/块/上下文 + 磁盘图片与 L1 缓存）超 `MIT_RETENTION_DAYS`（默认 14 天）自动清理；App 本地有译文缓存。
+  **已同步到云端（`cloud_books`）的书豁免 14 天清理**（书 zip 与翻译结果永久保留，取消同步才删）；
+  未同步的翻译结果仍按 14 天清理。App 端已同步的书用 `cloudId` 作为服务端 `book_id`（见 `Book.serverId`）
 - 全部参数可选：不传 `book_id/page_index` 自动落 `_adhoc_<图片sha1>` 桶
 - 上下文优先级：**App 传的 context > 服务端按 book_id 分桶的历史 > 无**
 - **存储分层**：DB 只存长期要查的（`books/pages/page_blocks/page_context/jobs` 5 表，
@@ -164,6 +179,15 @@ GET  /v1/health  、GET /v1/capabilities      # 后者含可用翻译器/默认�
 
 ## 9. 未完成 / 下一步
 
+- **✅ 云同步 + 多账号隔离已全链路落地（后端 + Android，均已验证）**：
+  - 后端：`users` 表（`id` + `api_key_hash` 唯一 + `name` + `token_used` + `page_count` + `last_active_at`）做「用户 id ↔ API Key」映射；
+    **账号 = API Key → users.id**（`MIT_API_TOKEN` 支持逗号分隔多 Key，一个 Key 一个账号）；`books`/`jobs`/`cloud_*` 的 `owner` 列存 users.id，
+    `/v1/books*`、`/v1/pages*`、`/v1/jobs*`、`/v1/cloud*` 全部按 owner 隔离（跨账号 404）。新增 `GET /v1/usage` 看当前账号用量。
+    保留期清理的 SELECT 与 DELETE **都排除 `cloud_books`**（已 A/B 验证：未同步 14 天删、已同步保留且图 HTTP 200）。
+    `cloud_contract_test.py` 8/8、`owner_isolation_test.py` 15/15 通过（含「两账号传同一本书 → 各自独立 id、互不可见/下载/删除」）。
+  - Android：书库三页签 + 三态角标、同步/取消同步/下载还原、导入 SHA-256 去重、设置页「API Key=账号」、
+    已同步书用 `cloudId` 作为服务端 `book_id`（`Book.serverId`）；**译文不打进 zip**（直接以服务端 books/pages 为准，实时同步），
+    下载/打开时从服务端拉最新译文，阅读器有「☁ 刷新」按钮。APK 已重打 `app-debug.apk`（约 10.2MB）并 adb 装机。
 - **✅ 本轮已修（4 个，均已重建容器并验证）**：① 网页端流式 → App 拿 1×1 白图（`share.py`）；② 无文字页引擎 500 → App 502（`to_json.py`）；③ App 不校验引擎图、把白图缓存成永久结果（`app_api/main.py`，含自愈）；④ 缓存命中不写 `page_context` 导致上下文退化（`app_api/main.py`）
 - （**待办**）**渲染字号偏大**：约 150 块里 22 块译文比原文大 1.8~4.7 倍，集中在"又高又窄"的竖排框。机制：渲染器直接画 `region.font_size`，而它 = 检测框短边（合并区域取各行最小值），**不是真实字号**，`default` 渲染器又不做缩放到框内。可调 `render.font_size_offset`（负值）/`render.font_size`（固定）、降 `detector.unclip_ratio`（2.3 → 1.4~1.6）、或把 App 默认 detector 从 `ctd`（气泡级框）换回 `default`（行级框）
 - （**待办，已确认但按用户要求搁置**）`target_lang=ENG` 时引擎返回 `{"ENG": "是姐姐啊"}` —— key 是 ENG 但内容是中文，即翻译器没按 target_lang 走（疑与进程内历史/提示模板相关）；当前只保证 DeepSeek→中文
@@ -176,4 +200,5 @@ GET  /v1/health  、GET /v1/capabilities      # 后者含可用翻译器/默认�
 
 ## 10. 一句话现状
 
-引擎（GPU、离线可跑）+ 中文链路（DeepSeek，术语表与跨页上下文均已接通）+ App 接口（MySQL/Redis/缓存/重译，一页 7~15s、缓存 ~0.2s）**全部可用且已通过 15+7 项接口测试**；剩余已知问题两个：部分文本块渲染字号偏大、`target_lang=ENG` 不生效（均不影响 DeepSeek→中文）。差的是提交存档与几个增强项。
+引擎（GPU、离线可跑）+ 中文链路（DeepSeek，术语表与跨页上下文均已接通）+ App 接口（MySQL/Redis/缓存/重译，一页 7~15s、缓存 ~0.2s）+ **云同步（书与翻译永久保留、多账号隔离）** 全部可用；
+Android App（EPUB/MOBI 阅读器 + 翻译 + 云同步）已打包。剩余已知问题两个：部分文本块渲染字号偏大、`target_lang=ENG` 不生效（均不影响 DeepSeek→中文）。差的是提交存档与几个增强项。

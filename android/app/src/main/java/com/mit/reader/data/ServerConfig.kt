@@ -25,6 +25,7 @@ object ServerConfig {
             prefs?.edit()?.putString(KEY_URL, value.trim().trimEnd('/'))?.apply()
         }
 
+    /** API Key 兼作账号：同一个 Key 的多台设备互通，不同 Key 互不可见（服务端用其 SHA-256 作 owner）。 */
     var apiKey: String
         get() = prefs?.getString(KEY_KEY, "")?.trim().orEmpty()
         set(value) {
