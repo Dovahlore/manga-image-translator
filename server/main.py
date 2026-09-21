@@ -6,6 +6,8 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
+import time
 from argparse import Namespace
 import asyncio
 
@@ -301,13 +303,35 @@ def start_translator_client_proc(host: str, port: int, nonce: str, params: Names
     proc = subprocess.Popen(cmds, cwd=parent)
     executor_instances.register(ExecutorInstance(ip=host, port=port))
 
-    def handle_exit_signals(signal, frame):
-        proc.terminate()
+    # worker 是独立子进程（持有 GPU 模型）。上游没做崩溃重启（源码里写着 TODO: restart if crash），
+    # 一旦 OOM/崩溃就变僵尸，网关对每个请求都 Connection refused → 全部翻译失败。
+    # 这里补一个监控线程：worker 退出后自动拉起（复用同一 ip:port，模型懒加载，起来后即恢复）。
+    shutdown = threading.Event()
+    holder = [proc]
+
+    def handle_exit_signals(signum, frame):
+        shutdown.set()
+        try:
+            holder[0].terminate()
+        except Exception:      # noqa: BLE001
+            pass
         sys.exit(0)
 
     signal.signal(signal.SIGINT, handle_exit_signals)
     signal.signal(signal.SIGTERM, handle_exit_signals)
 
+    def monitor():
+        while not shutdown.is_set():
+            code = holder[0].wait()
+            if shutdown.is_set():
+                break
+            print(f"[engine] 模型 worker 退出（exit code={code}），3 秒后自动重启…", flush=True)
+            time.sleep(3)
+            if shutdown.is_set():
+                break
+            holder[0] = subprocess.Popen(cmds, cwd=parent)
+
+    threading.Thread(target=monitor, daemon=True, name="engine-worker-monitor").start()
     return proc
 
 def prepare(args):

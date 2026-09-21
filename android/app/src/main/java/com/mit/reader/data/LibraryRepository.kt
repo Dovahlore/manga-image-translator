@@ -294,19 +294,52 @@ class LibraryRepository(private val context: Context) {
         book
     }
 
-    /** 从服务端拉该书已翻好的页到本地译文缓存。
-     *  overwrite=true 覆盖本地旧译文（别的设备重翻后同步）；false 只补缺失的（后台静默用）。返回已就绪页索引。 */
+    /** 从服务端拉该书已翻好的页到本地译文缓存（只补差异，不全量）。
+     *  overwrite=true 强制覆盖本地（别的设备重翻后同步）；false 只下载「本地缺失」或「服务端指纹变了」的页。
+     *  返回本次已就绪的页索引。 */
     suspend fun refreshTranslations(book: Book, overwrite: Boolean): Set<Int> = withContext(Dispatchers.IO) {
         val done = mutableSetOf<Int>()
         val pages = runCatching { api.bookPages(book.serverId) }.getOrNull() ?: return@withContext done
+        val metaFile = syncMetaFile(book.id)
+        val meta = readSyncMeta(metaFile)
+        var metaChanged = false
         for (p in pages) {
             if (p.status != "done" || p.pageIndex !in book.pageFiles.indices) continue
             val f = translatedCacheFile(book.id, p.pageIndex)
-            if (!overwrite && f.exists() && f.length() > 0L) { done += p.pageIndex; continue }
-            f.parentFile?.mkdirs()
-            runCatching { api.download(api.translatedUrl(p.id), f) }.onSuccess { done += p.pageIndex }
+            val fp = "${p.configHash}|${p.updatedAt}"
+            // 只补差异：本地没有 / 空文件 / 服务端指纹变了（多设备重翻导致）
+            val need = overwrite || !f.exists() || f.length() == 0L || meta[p.pageIndex] != fp
+            if (!need) { done += p.pageIndex; continue }
+            runCatching { downloadTranslatedPage(book.id, p.id, p.pageIndex) }.onSuccess {
+                done += p.pageIndex
+                meta[p.pageIndex] = fp
+                metaChanged = true
+            }
         }
+        if (metaChanged) writeSyncMeta(metaFile, meta)
         done
+    }
+
+    /** 每本书的译文同步指纹（pageIndex → config_hash|updated_at），判断该页要不要重新拉。 */
+    private fun syncMetaFile(bookId: String): File = File(File(translatedRoot, bookId), "sync_meta.json")
+
+    private fun readSyncMeta(f: File): MutableMap<Int, String> {
+        val m = mutableMapOf<Int, String>()
+        if (!f.exists()) return m
+        runCatching {
+            val o = JSONObject(f.readText())
+            o.keys().forEach { k -> k.toIntOrNull()?.let { m[it] = o.optString(k) } }
+        }
+        return m
+    }
+
+    private fun writeSyncMeta(f: File, meta: Map<Int, String>) {
+        runCatching {
+            val o = JSONObject()
+            meta.forEach { (k, v) -> o.put(k.toString(), v) }
+            f.parentFile?.mkdirs()
+            f.writeText(o.toString())
+        }
     }
 
     /** 打包：book.src + pages 目录 + manifest.json（译文不打进 zip，直接从服务端拉最新）。 */
@@ -388,6 +421,20 @@ class LibraryRepository(private val context: Context) {
     /** 某本书某页的译文缓存文件（本地缓存，服务端 14 天会删，这里留着）。服务端现发 WebP 无损。 */
     fun translatedCacheFile(bookId: String, pageIndex: Int): File =
         File(File(translatedRoot, bookId), pageIndex.toString().padStart(3, '0') + ".webp")
+
+    /** 原子下载译文页到本地缓存：先写临时文件再改名，避免「后台全书翻译」和「打开阅读器补拉」并发写坏同一文件。 */
+    suspend fun downloadTranslatedPage(bookId: String, pageId: Int, pageIndex: Int): File {
+        val f = translatedCacheFile(bookId, pageIndex)
+        f.parentFile?.mkdirs()
+        val tmp = File(f.parentFile, "${f.name}.${UUID.randomUUID()}.tmp")
+        try {
+            api.download(api.translatedUrl(pageId), tmp)
+            if (!tmp.renameTo(f)) tmp.copyTo(f, overwrite = true)
+        } finally {
+            tmp.delete()
+        }
+        return f
+    }
 
     fun epubFile(bookId: String): File = File(File(root, bookId), "book.src")
 

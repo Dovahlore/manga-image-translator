@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS page_context (
 CREATE TABLE IF NOT EXISTS jobs (
   id          VARCHAR(36) PRIMARY KEY,
   owner       VARCHAR(191) NOT NULL DEFAULT 'default',  -- 任务归属账号（与 books.owner 同源）
+  book_id     VARCHAR(191) NULL,           -- whole-book 任务归属的书（删书/取消同步时按书取消后台任务）
   page_id     BIGINT      NULL,           -- 完成后回填；页删了跟着删
   action      VARCHAR(32) NOT NULL,       -- translate / retranslate
   status      VARCHAR(16) NOT NULL,       -- queued / running / done / failed
@@ -113,6 +114,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   finished_at DATETIME NULL,
   KEY idx_status (status),
   KEY idx_owner (owner),
+  KEY idx_jobs_book (book_id),
   CONSTRAINT fk_jobs_page FOREIGN KEY (page_id) REFERENCES pages (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 

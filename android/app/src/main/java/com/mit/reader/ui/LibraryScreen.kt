@@ -37,11 +37,13 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -123,7 +125,7 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
     var syncing by remember { mutableStateOf<SyncTask?>(null) }
     var gridMode by remember { mutableStateOf(true) }
     var sortMode by remember { mutableStateOf(SortMode.NAME) }
-    var sortMenuOpen by remember { mutableStateOf(false) }
+    var viewMenuOpen by remember { mutableStateOf(false) }
     var moveTarget by remember { mutableStateOf<Book?>(null) }
     var showCreateFolder by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf<Book?>(null) }
@@ -259,6 +261,7 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                         )
+                        tab == 3 -> Text("进度")
                         currentFolderId != null -> {
                             val folder = folders.find { it.id == currentFolderId }
                             if (folder != null) {
@@ -280,6 +283,7 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
                         searchActive -> IconButton(onClick = { searchActive = false; searchQuery = "" }) {
                             Icon(Icons.Default.ArrowBack, contentDescription = "退出搜索")
                         }
+                        tab == 3 -> Unit   // 进度是全局视图，不显示文件夹返回箭头
                         currentFolderId != null -> IconButton(onClick = { currentFolderId = null }) {
                             Icon(Icons.Default.ArrowBack, contentDescription = "返回")
                         }
@@ -289,19 +293,36 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
                     if (searchActive) {
                         IconButton(onClick = { searchQuery = "" }) { Icon(Icons.Default.Close, contentDescription = "清空") }
                     } else {
+                        // 后台同步云端译文到本地时显示小转圈
+                        if (app.syncingTranslations) {
+                            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        }
                         IconButton(onClick = { searchActive = true }) { Icon(Icons.Default.Search, contentDescription = "搜索") }
                         Box {
-                            TextButton(onClick = { sortMenuOpen = true }) { Text(sortMode.label) }
-                            DropdownMenu(expanded = sortMenuOpen, onDismissRequest = { sortMenuOpen = false }) {
+                            IconButton(onClick = { viewMenuOpen = true }) {
+                                Icon(Icons.Default.MoreVert, contentDescription = "视图与排序")
+                            }
+                            DropdownMenu(expanded = viewMenuOpen, onDismissRequest = { viewMenuOpen = false }) {
+                                DropdownMenuItem(
+                                    text = { Text(if (gridMode) "列表视图" else "网格视图") },
+                                    onClick = { gridMode = !gridMode; viewMenuOpen = false },
+                                )
+                                HorizontalDivider()
                                 SortMode.entries.forEach { m ->
                                     DropdownMenuItem(
-                                        text = { Text(m.label) },
-                                        onClick = { sortMode = m; sortMenuOpen = false },
+                                        text = {
+                                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                                Text(m.label, modifier = Modifier.weight(1f))
+                                                if (sortMode == m) {
+                                                    Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(18.dp))
+                                                }
+                                            }
+                                        },
+                                        onClick = { sortMode = m; viewMenuOpen = false },
                                     )
                                 }
                             }
                         }
-                        TextButton(onClick = { gridMode = !gridMode }) { Text(if (gridMode) "列表" else "网格") }
                         IconButton(onClick = onSettings) { Icon(Icons.Default.Settings, contentDescription = "设置") }
                     }
                 },
@@ -336,6 +357,7 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
                         error = progressErr,
                         translatingBookId = app.translatingBookId,
                         translatingProgress = app.translatingProgress,
+                        queuedBookIds = app.queuedBookIds.toSet(),
                         onStop = { app.stopTranslatingIf(it.id) },
                     )
                 } else {
@@ -376,6 +398,7 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
                         onDeleteCloud = { doDeleteCloud(it) },
                         translatingBookId = app.translatingBookId,
                         translatingProgress = app.translatingProgress,
+                        queuedBookIds = app.queuedBookIds.toSet(),
                         syncing = syncing,
                         gridMode = gridMode,
                     )
@@ -539,6 +562,7 @@ private fun LibraryTab(
     onDeleteCloud: (CloudBook) -> Unit,
     translatingBookId: String?,
     translatingProgress: Pair<Int, Int>?,
+    queuedBookIds: Set<String>,
     syncing: SyncTask?,
     gridMode: Boolean,
 ) {
@@ -596,6 +620,7 @@ private fun LibraryTab(
                         onSync = { onSync(book) },
                         onCancelSync = { onCancelSync(book) },
                         isTranslating = translatingBookId == book.id,
+                        isQueued = book.id in queuedBookIds,
                         progressText = if (translatingBookId == book.id) translatingProgress?.let { "${it.first}/${it.second}" } else null,
                         syncing = syncing,
                     )
@@ -625,6 +650,7 @@ private fun LibraryTab(
                         onSync = { onSync(book) },
                         onCancelSync = { onCancelSync(book) },
                         isTranslating = translatingBookId == book.id,
+                        isQueued = book.id in queuedBookIds,
                         progressText = if (translatingBookId == book.id) translatingProgress?.let { "${it.first}/${it.second}" } else null,
                         syncing = syncing,
                     )
@@ -701,6 +727,7 @@ private fun LibraryTab(
                         onSync = { onSync(book) },
                         onCancelSync = { onCancelSync(book) },
                         isTranslating = translatingBookId == book.id,
+                        isQueued = book.id in queuedBookIds,
                         progressText = if (translatingBookId == book.id) translatingProgress?.let { "${it.first}/${it.second}" } else null,
                         syncing = syncing,
                     )
@@ -780,6 +807,7 @@ private fun LibraryTab(
                         onSync = { onSync(book) },
                         onCancelSync = { onCancelSync(book) },
                         isTranslating = translatingBookId == book.id,
+                        isQueued = book.id in queuedBookIds,
                         progressText = if (translatingBookId == book.id) translatingProgress?.let { "${it.first}/${it.second}" } else null,
                         syncing = syncing,
                     )
@@ -971,6 +999,7 @@ private fun BookCell(
     onSync: () -> Unit = {},
     onCancelSync: () -> Unit = {},
     isTranslating: Boolean,
+    isQueued: Boolean = false,
     progressText: String?,
     syncing: SyncTask? = null,
 ) {
@@ -1004,9 +1033,9 @@ private fun BookCell(
                 )
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                     DropdownMenuItem(
-                        text = { Text(if (isTranslating) "翻译中…" else "全书翻译") },
+                        text = { Text(if (isTranslating) "翻译中…" else if (isQueued) "排队中…" else "全书翻译") },
                         onClick = { menuOpen = false; onTranslateAll() },
-                        enabled = !isTranslating,
+                        enabled = !isTranslating && !isQueued,
                     )
                     if (synced) {
                         DropdownMenuItem(text = { Text("取消同步") }, onClick = { menuOpen = false; onCancelSync() })
@@ -1047,6 +1076,12 @@ private fun BookCell(
             )
             Text(
                 "翻译中 $progressText",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.tertiary,
+            )
+        } else if (isQueued) {
+            Text(
+                "排队中…",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.tertiary,
             )
@@ -1173,6 +1208,7 @@ private fun BookRow(
     onSync: () -> Unit = {},
     onCancelSync: () -> Unit = {},
     isTranslating: Boolean,
+    isQueued: Boolean = false,
     progressText: String?,
     syncing: SyncTask? = null,
 ) {
@@ -1207,6 +1243,8 @@ private fun BookRow(
                     modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
                 )
                 Text("翻译中 $progressText", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.tertiary)
+            } else if (isQueued) {
+                Text("排队中…", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.tertiary)
             }
             if (syncing?.id == book.id) {
                 SyncProgressLine(syncing!!.text, syncing!!.frac)
@@ -1477,6 +1515,7 @@ private fun ProgressList(
     error: String?,
     translatingBookId: String?,
     translatingProgress: Pair<Int, Int>?,
+    queuedBookIds: Set<String>,
     onStop: (Book) -> Unit,
 ) {
     if (error != null) {
@@ -1495,6 +1534,7 @@ private fun ProgressList(
     val serverMap = serverBooks.associateBy { it.id }
     val visibleBooks = books.filter { book ->
         translatingBookId == book.id ||
+            book.id in queuedBookIds ||
             (serverMap[book.serverId]?.let { it.donePages + it.failedPages > 0 } == true)
     }
     if (visibleBooks.isEmpty()) {
@@ -1511,16 +1551,18 @@ private fun ProgressList(
         listItems(visibleBooks, key = { it.id }) { book ->
             val s = serverMap[book.serverId]
             val isRunning = translatingBookId == book.id
+            val isQueued = book.id in queuedBookIds
             val done = if (isRunning) (translatingProgress?.first ?: 0) else (s?.donePages ?: 0)
             val failed = s?.failedPages ?: 0
             val total = book.pageCount
             val status = when {
                 isRunning -> "进行中"
+                isQueued -> "排队中"
                 done >= total && failed == 0 -> "已完成"
                 failed > 0 && done + failed >= total -> "部分失败"
                 else -> ""   // 部分翻译但没在跑：不显示状态，只显示页数
             }
-            BookProgressRow(book.title, status, done, failed, total, isRunning, onStop = { onStop(book) })
+            BookProgressRow(book.title, status, done, failed, total, isRunning, isQueued, onStop = { onStop(book) })
         }
     }
 }
@@ -1533,6 +1575,7 @@ private fun BookProgressRow(
     failed: Int,
     total: Int,
     isRunning: Boolean,
+    isQueued: Boolean,
     onStop: () -> Unit,
 ) {
     Column(Modifier.fillMaxWidth()) {
@@ -1550,7 +1593,7 @@ private fun BookProgressRow(
                     },
                 )
             }
-            if (isRunning) {
+            if (isRunning || isQueued) {
                 TextButton(onClick = onStop) { Text("停止") }
             }
         }
@@ -1559,6 +1602,7 @@ private fun BookProgressRow(
                 append("$done / $total 页")
                 if (failed > 0) append(" · 失败 $failed")
                 if (isRunning && done < total) append(" · 后台翻译中")
+                if (isQueued) append(" · 排队中")
             },
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,

@@ -209,6 +209,18 @@ def init_schema(retries: int = 30, delay: float = 2.0):
                         cur.execute(
                             "INSERT INTO users (api_key_hash) VALUES (%s) "
                             "ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id)", (h,))
+                # 10) jobs 补 book_id 列：whole-book 任务之前没记录书，删书/取消同步时
+                #     无法按书取消后台任务（孤儿 job 继续翻）。加这列后可按书取消。
+                cur.execute(
+                    "SELECT COUNT(*) AS c FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='jobs' AND COLUMN_NAME='book_id'")
+                if cur.fetchone()["c"] == 0:
+                    cur.execute("ALTER TABLE jobs ADD COLUMN book_id VARCHAR(191) NULL")
+                cur.execute(
+                    "SELECT COUNT(*) AS c FROM information_schema.STATISTICS "
+                    "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='jobs' AND INDEX_NAME='idx_jobs_book'")
+                if cur.fetchone()["c"] == 0:
+                    cur.execute("CREATE INDEX idx_jobs_book ON jobs (book_id)")
             conn.close()
             return len(stmts)
         except Exception as e:      # noqa: BLE001

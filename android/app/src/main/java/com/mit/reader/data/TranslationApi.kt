@@ -15,7 +15,13 @@ import java.util.concurrent.TimeUnit
 
 data class TranslateResp(val pageId: Int, val jobId: String?, val cached: Boolean)
 data class JobStatus(val status: String, val pageId: Int?, val error: String?)
-data class ServerPage(val id: Int, val pageIndex: Int, val status: String)
+data class ServerPage(
+    val id: Int,
+    val pageIndex: Int,
+    val status: String,
+    val configHash: String = "",
+    val updatedAt: String = "",
+)
 data class ServerBook(
     val id: String,
     val title: String?,
@@ -137,6 +143,8 @@ class TranslationApi {
                         id = o.getInt("id"),
                         pageIndex = o.getInt("page_index"),
                         status = o.getString("status"),
+                        configHash = o.optString("config_hash", ""),
+                        updatedAt = o.optString("updated_at", ""),
                     )
                 }
             }
@@ -195,6 +203,14 @@ class TranslationApi {
     suspend fun cancelJob(jobId: String): Boolean =
         kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
             val req = Request.Builder().url("$base/v1/jobs/$jobId/cancel").authed()
+                .post(ByteArray(0).toRequestBody(null)).build()
+            client.newCall(req).execute().use { it.isSuccessful }
+        }
+
+    /** 取消某本书的所有后台任务（覆盖进程被杀后遗留的重复 job）。 */
+    suspend fun cancelBookJobs(bookId: String): Boolean =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val req = Request.Builder().url("$base/v1/books/$bookId/cancel").authed()
                 .post(ByteArray(0).toRequestBody(null)).build()
             client.newCall(req).execute().use { it.isSuccessful }
         }

@@ -11,6 +11,8 @@ import androidx.lifecycle.viewModelScope
 import com.mit.reader.data.Book
 import com.mit.reader.data.serverId
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import java.io.File
 
@@ -39,6 +41,7 @@ class ReaderViewModel(private val app: Application) : AndroidViewModel(app) {
     val pageStates = mutableStateMapOf<Int, PageState>()
 
     private val pages: List<File> get() = book?.pageFiles ?: emptyList()
+    private var watchJob: Job? = null
 
     fun load(b: Book) {
         book = b
@@ -54,15 +57,26 @@ class ReaderViewModel(private val app: Application) : AndroidViewModel(app) {
                 pageStates[i] = PageState(status = PageStatus.DONE, translatedFile = f)
             }
         }
-        // 已同步到云端的书：后台自动拉最新译文（覆盖本地，别的设备新翻/重翻的页都同步过来）
-        if (b.cloudId != null) refreshFromCloud()
+        // 打开阅读器时从服务端补拉译文页（所有书都拉：同步书别的设备新翻的、非同步书服务端已翻好的都补齐）。
+        // 只补本地缺的/指纹变了的，不全量。
+        refreshFromServer()
+        // 事件驱动：后台「全书翻译」每下好一页就发事件，这里按书过滤、更新 pageStates（免轮询）
+        watchJob?.cancel()
+        watchJob = viewModelScope.launch {
+            readerApp.pageTranslated.collect { (bookId, pageIndex) ->
+                if (bookId == b.id && pageIndex in b.pageFiles.indices) {
+                    val f = readerApp.library.translatedCacheFile(b.id, pageIndex)
+                    pageStates[pageIndex] = PageState(status = PageStatus.DONE, translatedFile = f)
+                }
+            }
+        }
     }
 
-    /** 同步书：后台从服务端拉全部已翻页（覆盖本地缓存，别的设备新翻/重翻都自动同步）。 */
-    private fun refreshFromCloud() {
+    /** 从服务端补拉译文页到本地（只补缺失/指纹变化的页），再标 DONE。 */
+    private fun refreshFromServer() {
         val b = book ?: return
         viewModelScope.launch {
-            val doneIdx = readerApp.library.refreshTranslations(b, overwrite = true)
+            val doneIdx = readerApp.library.refreshTranslations(b, overwrite = false)
             for (i in doneIdx) {
                 pageStates[i] = PageState(
                     status = PageStatus.DONE,

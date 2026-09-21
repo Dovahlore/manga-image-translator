@@ -36,6 +36,24 @@ from . import settings as S
 _redis: Optional[aioredis.Redis] = None
 _engine_sem = asyncio.Semaphore(1)          # 引擎是单 worker（GPU 独占），这里排队
 _book_locks: Dict[str, asyncio.Lock] = {}   # 同一本书的页串行，保证上下文顺序
+_whole_book_queue: asyncio.Queue = asyncio.Queue()   # 全书翻译任务 FIFO 队列：一次只跑一本，其余排队
+
+
+async def _whole_book_worker() -> None:
+    """全书翻译串行执行器：引擎只有一块 GPU，多本书按提交顺序一本本翻，其余保持 queued。"""
+    while True:
+        job_id, fn = await _whole_book_queue.get()
+        try:
+            # 排队期间可能被取消（删书 / 取消同步 / 点停止）：直接跳过
+            row = await run_in_threadpool(db.query_one, "SELECT status FROM jobs WHERE id=%s", (job_id,))
+            if row and row["status"] == "cancelled":
+                continue
+            await fn()
+        except Exception:      # noqa: BLE001
+            # fn 内部已捕获并落状态，这里兜底防 worker 崩
+            pass
+        finally:
+            _whole_book_queue.task_done()
 
 
 @asynccontextmanager
@@ -54,8 +72,10 @@ async def lifespan(app: FastAPI):
         print(f"[app-api] Redis 不可用（缓存锁降级为进程内）: {e}", flush=True)
         _redis = None
     cleanup_task = asyncio.create_task(_retention_loop())
+    whole_book_worker = asyncio.create_task(_whole_book_worker())
     yield
     cleanup_task.cancel()
+    whole_book_worker.cancel()
     if _redis:
         await _redis.aclose()
 
@@ -580,8 +600,8 @@ async def translate_page(
     job_id = str(uuid.uuid4())
     await run_in_threadpool(
         db.execute,
-        "INSERT INTO jobs (id, owner, action, status, config_json) VALUES (%s,%s,'translate','queued',%s)",
-        (job_id, owner, json.dumps({k: v for k, v in cfg.items() if k != "context_text"}, ensure_ascii=False)))
+        "INSERT INTO jobs (id, owner, book_id, action, status, config_json) VALUES (%s,%s,%s,'translate','queued',%s)",
+        (job_id, owner, book_id, json.dumps({k: v for k, v in cfg.items() if k != "context_text"}, ensure_ascii=False)))
 
     if async_mode:
         asyncio.create_task(_run_translate_job(
@@ -968,15 +988,21 @@ async def translate_all(
     job_id = str(uuid.uuid4())
     await run_in_threadpool(
         db.execute,
-        "INSERT INTO jobs (id, owner, action, status, config_json) VALUES (%s,%s,'translate_all','queued',%s)",
-        (job_id, owner, json.dumps({k: v for k, v in cfg.items() if k != "context_text"}, ensure_ascii=False)))
-    asyncio.create_task(_run_translate_all(job_id, owner, book_id, title, order_dir, cfg, indices, raws, force))
+        "INSERT INTO jobs (id, owner, book_id, action, status, config_json) VALUES (%s,%s,%s,'translate_all','queued',%s)",
+        (job_id, owner, book_id, json.dumps({k: v for k, v in cfg.items() if k != "context_text"}, ensure_ascii=False)))
+    await _whole_book_queue.put(
+        (job_id, lambda: _run_translate_all(job_id, owner, book_id, title, order_dir, cfg, indices, raws, force)))
     return {"book_job_id": job_id, "status": "queued", "total": len(raws)}
 
 
 async def _run_translate_all(job_id, owner, book_id, title, order_dir, cfg, indices, raws, force) -> None:
     """后台按顺序翻完整本书：逐页复用 _execute_translate（含 L1 缓存 + 上下文 + 落库）。"""
-    await run_in_threadpool(db.execute, "UPDATE jobs SET status='running', started_at=NOW() WHERE id=%s", (job_id,))
+    await run_in_threadpool(db.execute,
+                            "UPDATE jobs SET status='running', started_at=NOW() WHERE id=%s AND status='queued'",
+                            (job_id,))
+    j = await run_in_threadpool(db.query_one, "SELECT status FROM jobs WHERE id=%s", (job_id,))
+    if not j or j["status"] != "running":
+        return   # 排队期间被取消，直接退出
     try:
         for idx, raw in zip(indices, raws):
             # 书被删（删书/取消同步）就停：否则 _persist_page 会把已删的书又建回来
@@ -1061,15 +1087,21 @@ async def translate_all_from_zip(
     job_id = str(uuid.uuid4())
     await run_in_threadpool(
         db.execute,
-        "INSERT INTO jobs (id, owner, action, status, config_json) VALUES (%s,%s,'translate_all','queued',%s)",
-        (job_id, owner, json.dumps({k: v for k, v in cfg.items() if k != "context_text"}, ensure_ascii=False)))
-    asyncio.create_task(_run_translate_all_from_zip(job_id, owner, book_id, title, order_dir, cfg, indices, names, force))
+        "INSERT INTO jobs (id, owner, book_id, action, status, config_json) VALUES (%s,%s,%s,'translate_all','queued',%s)",
+        (job_id, owner, book_id, json.dumps({k: v for k, v in cfg.items() if k != "context_text"}, ensure_ascii=False)))
+    await _whole_book_queue.put(
+        (job_id, lambda: _run_translate_all_from_zip(job_id, owner, book_id, title, order_dir, cfg, indices, names, force)))
     return {"book_job_id": job_id, "status": "queued", "total": len(indices)}
 
 
 async def _run_translate_all_from_zip(job_id, owner, book_id, title, order_dir, cfg, indices, names, force) -> None:
     """后台从 zip 逐页取图翻译（不一次性读进内存）。"""
-    await run_in_threadpool(db.execute, "UPDATE jobs SET status='running', started_at=NOW() WHERE id=%s", (job_id,))
+    await run_in_threadpool(db.execute,
+                            "UPDATE jobs SET status='running', started_at=NOW() WHERE id=%s AND status='queued'",
+                            (job_id,))
+    j = await run_in_threadpool(db.query_one, "SELECT status FROM jobs WHERE id=%s", (job_id,))
+    if not j or j["status"] != "running":
+        return   # 排队期间被取消，直接退出
     row = await run_in_threadpool(db.query_one, "SELECT zip_path FROM books WHERE id=%s", (book_id,))
     try:
         with zipfile.ZipFile(Path(row["zip_path"])) as z:
@@ -1138,8 +1170,8 @@ async def translate_book_page(book_id: str, page_index: int, force: bool = Form(
     job_id = str(uuid.uuid4())
     await run_in_threadpool(
         db.execute,
-        "INSERT INTO jobs (id, owner, action, status, config_json) VALUES (%s,%s,'translate','queued',%s)",
-        (job_id, owner, json.dumps({k: v for k, v in cfg.items() if k != "context_text"}, ensure_ascii=False)))
+        "INSERT INTO jobs (id, owner, book_id, action, status, config_json) VALUES (%s,%s,%s,'translate','queued',%s)",
+        (job_id, owner, book_id, json.dumps({k: v for k, v in cfg.items() if k != "context_text"}, ensure_ascii=False)))
     asyncio.create_task(_run_translate_job(job_id, owner, raw, cfg, book_id, page_index, None, None,
                                            img_sha, cfg_hash, cache_key, png_path, redis_key,
                                            ctx_source, False, force))
@@ -1151,6 +1183,10 @@ async def delete_book(book_id: str, owner: str = Depends(get_owner)):
     """删书（端到端）：DB 里的书/页/块/上下文/任务靠外键级联删，磁盘上的页文件一并删。"""
     pages = await run_in_threadpool(
         db.query, "SELECT COUNT(*) AS n FROM pages WHERE book_id=%s", (book_id,))
+    # 先停掉这本书的所有后台任务（whole-book 任务 page_id 为 NULL，不随 pages 级联删）
+    await run_in_threadpool(
+        db.execute, "UPDATE jobs SET status='cancelled', finished_at=NOW() "
+                    "WHERE book_id=%s AND status IN ('queued','running')", (book_id,))
     await run_in_threadpool(db.execute, "DELETE FROM books WHERE id=%s AND owner=%s", (book_id, owner))
     await run_in_threadpool(_rmtree_safe, S.BOOKS_DIR / _safe(book_id))
     _mark_book_deleted(book_id)   # 墓碑：后台任务别再把它翻回来
@@ -1178,6 +1214,16 @@ async def job_cancel(job_id: str, owner: str = Depends(get_owner)):
         db.execute, "UPDATE jobs SET status='cancelled', finished_at=NOW() WHERE id=%s AND owner=%s",
         (job_id, owner))
     return {"ok": True, "job_id": job_id}
+
+
+@app.post("/v1/books/{book_id}/cancel", dependencies=[Depends(auth)])
+async def cancel_book_jobs(book_id: str, owner: str = Depends(get_owner)):
+    """取消某本书的所有后台任务（whole-book / 单页都按书停），覆盖进程被杀后遗留的重复 job。"""
+    await run_in_threadpool(
+        db.execute, "UPDATE jobs SET status='cancelled', finished_at=NOW() "
+                    "WHERE book_id=%s AND owner=%s AND status IN ('queued','running')",
+        (book_id, owner))
+    return {"ok": True, "book_id": book_id}
 
 
 # ================================================================ 云同步
