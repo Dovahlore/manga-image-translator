@@ -28,6 +28,7 @@ data class ServerBook(
     val pageCount: Int?,
     val donePages: Int,
     val failedPages: Int,
+    val activeJobs: Int = 0,
 )
 data class CloudUploadResp(val bookId: String, val existed: Boolean)
 data class CloudBook(
@@ -119,10 +120,11 @@ class TranslationApi {
                     val o = arr.getJSONObject(i)
                     ServerBook(
                         id = o.getString("id"),
-                        title = o.optString("title").takeIf { it.isNotBlank() },
+                        title = if (o.isNull("title")) null else o.optString("title").takeIf { it.isNotBlank() },
                         pageCount = if (o.isNull("page_count")) null else o.optInt("page_count"),
                         donePages = o.optInt("done_pages", 0),
                         failedPages = o.optInt("failed_pages", 0),
+                        activeJobs = o.optInt("active_jobs", 0),
                     )
                 }
             }
@@ -177,16 +179,19 @@ class TranslationApi {
         }
     }
 
-    /** 全书翻译（服务端自取图）：已同步的书从云端 zip 取图，不上传页图。返回 book_job_id。 */
+    /** 全书翻译（服务端自取图）：已同步的书从云端 zip 取图，不上传页图。返回 book_job_id。
+     *  pageIndices 传 null/空 = 翻译全部页。 */
     suspend fun translateAllFromZip(
         bookId: String,
         title: String?,
         orderDir: String?,
-        pageIndices: List<Int>,
+        pageIndices: List<Int>? = null,
         force: Boolean = false,
     ): String = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
         val body = MultipartBody.Builder().setType(MultipartBody.FORM)
-            .addFormDataPart("page_indices", JSONArray(pageIndices).toString())
+        if (!pageIndices.isNullOrEmpty()) {
+            body.addFormDataPart("page_indices", JSONArray(pageIndices).toString())
+        }
         title?.takeIf { it.isNotBlank() }?.let { body.addFormDataPart("title", it) }
         orderDir?.let { body.addFormDataPart("order_dir", it) }
         if (force) body.addFormDataPart("force", "true")
@@ -324,13 +329,13 @@ class TranslationApi {
                 val o = arr.getJSONObject(i)
                 CloudBook(
                     id = o.getString("id"),
-                    title = o.optString("title").takeIf { it.isNotBlank() },
+                    title = if (o.isNull("title")) null else o.optString("title").takeIf { it.isNotBlank() },
                     mode = o.optString("mode", "manga"),
                     pageCount = if (o.isNull("page_count")) null else o.optInt("page_count"),
-                    hash = o.optString("hash").takeIf { it.isNotBlank() },
-                    fingerprint = o.optString("fingerprint").takeIf { it.isNotBlank() },
+                    hash = if (o.isNull("hash")) null else o.optString("hash").takeIf { it.isNotBlank() },
+                    fingerprint = if (o.isNull("fingerprint")) null else o.optString("fingerprint").takeIf { it.isNotBlank() },
                     size = if (o.isNull("size")) null else o.optLong("size"),
-                    folder = o.optString("folder").takeIf { it.isNotBlank() },
+                    folder = if (o.isNull("folder")) null else o.optString("folder").takeIf { it.isNotBlank() },
                 )
             }
         }

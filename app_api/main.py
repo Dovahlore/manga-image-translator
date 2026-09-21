@@ -63,6 +63,12 @@ async def lifespan(app: FastAPI):
     S.BOOKS_DIR.mkdir(parents=True, exist_ok=True)
     n = await run_in_threadpool(db.init_schema)
     print(f"[app-api] 数据库就绪，执行了 {n} 条 DDL", flush=True)
+    # 容器重启后，内存里的任务队列与后台协程都没了：把遗留的 queued/running 任务标记为中断，
+    # 避免它们永远卡在 running（App 端看会误以为还在翻）
+    await run_in_threadpool(
+        db.execute,
+        "UPDATE jobs SET status='failed', finished_at=NOW(), error='服务重启，任务中断' "
+        "WHERE status IN ('queued','running')")
     try:
         _redis = aioredis.from_url(S.REDIS_URL, password=S.REDIS_PASSWORD or None,
                                    decode_responses=True)
@@ -917,7 +923,8 @@ async def list_books(owner: str = Depends(get_owner)):
         db.query, "SELECT b.*, "
                   "(SELECT COUNT(*) FROM pages p WHERE p.book_id=b.id) AS translated_pages, "
                   "(SELECT COUNT(*) FROM pages p WHERE p.book_id=b.id AND p.status='done') AS done_pages, "
-                  "(SELECT COUNT(*) FROM pages p WHERE p.book_id=b.id AND p.status='failed') AS failed_pages "
+                  "(SELECT COUNT(*) FROM pages p WHERE p.book_id=b.id AND p.status='failed') AS failed_pages, "
+                  "(SELECT COUNT(*) FROM jobs j WHERE j.book_id=b.id AND j.status IN ('queued','running')) AS active_jobs "
                   "FROM books b WHERE b.owner=%s ORDER BY b.updated_at DESC LIMIT 200", (owner,))}
 
 
@@ -985,6 +992,12 @@ async def translate_all(
         "order_dir=COALESCE(VALUES(order_dir),order_dir)",
         (book_id, title, None, page_count, order_dir, owner))
 
+    # 同一本书已存在活动任务：不重复建 job，直接返回已有的 job id（防云端/本地重复触发）
+    existing = await run_in_threadpool(
+        db.query_one, "SELECT id FROM jobs WHERE book_id=%s AND status IN ('queued','running') LIMIT 1", (book_id,))
+    if existing:
+        return {"book_job_id": existing["id"], "status": "queued", "duplicate": True}
+
     job_id = str(uuid.uuid4())
     await run_in_threadpool(
         db.execute,
@@ -1003,6 +1016,7 @@ async def _run_translate_all(job_id, owner, book_id, title, order_dir, cfg, indi
     j = await run_in_threadpool(db.query_one, "SELECT status FROM jobs WHERE id=%s", (job_id,))
     if not j or j["status"] != "running":
         return   # 排队期间被取消，直接退出
+    cancelled = False
     try:
         for idx, raw in zip(indices, raws):
             # 书被删（删书/取消同步）就停：否则 _persist_page 会把已删的书又建回来
@@ -1013,6 +1027,7 @@ async def _run_translate_all(job_id, owner, book_id, title, order_dir, cfg, indi
             # 用户点「停止」→ job 标记 cancelled，这里停下
             j = await run_in_threadpool(db.query_one, "SELECT status FROM jobs WHERE id=%s", (job_id,))
             if j and j["status"] == "cancelled":
+                cancelled = True
                 break
             img_sha = sha1_bytes(raw)
             cfg_hash = pipeline_hash(cfg)
@@ -1038,7 +1053,8 @@ async def _run_translate_all(job_id, owner, book_id, title, order_dir, cfg, indi
                 await run_in_threadpool(
                     _persist_page, book_id, owner, idx, order_dir, title, img_sha, cfg_hash,
                     raw, None, None, "failed", 1, str(e)[:2000], 0, None)
-        await run_in_threadpool(db.execute, "UPDATE jobs SET status='done', finished_at=NOW() WHERE id=%s", (job_id,))
+        if not cancelled:
+            await run_in_threadpool(db.execute, "UPDATE jobs SET status='done', finished_at=NOW() WHERE id=%s", (job_id,))
     except Exception as e:      # noqa: BLE001
         await run_in_threadpool(db.execute,
                                 "UPDATE jobs SET status='failed', finished_at=NOW(), error=%s WHERE id=%s",
@@ -1084,6 +1100,12 @@ async def translate_all_from_zip(
     overrides = json.loads(config) if config else {}
     cfg = deep_merge(S.DEFAULT_CONFIG, overrides)
 
+    # 同一本书已存在活动任务：不重复建 job，直接返回已有的 job id（防云端/本地重复触发）
+    existing = await run_in_threadpool(
+        db.query_one, "SELECT id FROM jobs WHERE book_id=%s AND status IN ('queued','running') LIMIT 1", (book_id,))
+    if existing:
+        return {"book_job_id": existing["id"], "status": "queued", "duplicate": True}
+
     job_id = str(uuid.uuid4())
     await run_in_threadpool(
         db.execute,
@@ -1103,6 +1125,7 @@ async def _run_translate_all_from_zip(job_id, owner, book_id, title, order_dir, 
     if not j or j["status"] != "running":
         return   # 排队期间被取消，直接退出
     row = await run_in_threadpool(db.query_one, "SELECT zip_path FROM books WHERE id=%s", (book_id,))
+    cancelled = False
     try:
         with zipfile.ZipFile(Path(row["zip_path"])) as z:
             for idx in indices:
@@ -1112,6 +1135,7 @@ async def _run_translate_all_from_zip(job_id, owner, book_id, title, order_dir, 
                     break
                 j = await run_in_threadpool(db.query_one, "SELECT status FROM jobs WHERE id=%s", (job_id,))
                 if j and j["status"] == "cancelled":
+                    cancelled = True
                     break
                 raw = z.read(names[idx])
                 img_sha = sha1_bytes(raw)
@@ -1136,7 +1160,8 @@ async def _run_translate_all_from_zip(job_id, owner, book_id, title, order_dir, 
                     await run_in_threadpool(
                         _persist_page, book_id, owner, idx, order_dir, title, img_sha, cfg_hash,
                         raw, None, None, "failed", 1, str(e)[:2000], 0, None)
-        await run_in_threadpool(db.execute, "UPDATE jobs SET status='done', finished_at=NOW() WHERE id=%s", (job_id,))
+        if not cancelled:
+            await run_in_threadpool(db.execute, "UPDATE jobs SET status='done', finished_at=NOW() WHERE id=%s", (job_id,))
     except Exception as e:      # noqa: BLE001
         await run_in_threadpool(db.execute,
                                 "UPDATE jobs SET status='failed', finished_at=NOW(), error=%s WHERE id=%s",

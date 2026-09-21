@@ -127,6 +127,7 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
     var sortMode by remember { mutableStateOf(SortMode.NAME) }
     var viewMenuOpen by remember { mutableStateOf(false) }
     var moveTarget by remember { mutableStateOf<Book?>(null) }
+    var moveCloudTarget by remember { mutableStateOf<CloudBook?>(null) }
     var showCreateFolder by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf<Book?>(null) }
     var confirmCancelSync by remember { mutableStateOf<Book?>(null) }
@@ -229,6 +230,26 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
                 .onSuccess { Toast.makeText(app, "已下载《${it.title}》", Toast.LENGTH_SHORT).show(); reload() }
                 .onFailure { Toast.makeText(app, "下载失败：${it.message}", Toast.LENGTH_LONG).show() }
             syncing = null
+        }
+    }
+
+    /** 云端书（未下载到本地）全书翻译：服务端直接从云端 zip 取图翻译，不上传图片。 */
+    fun doTranslateAllCloud(cb: CloudBook) {
+        scope.launch {
+            runCatching { app.api.translateAllFromZip(cb.id, cb.title, "rtl", null) }
+                .onSuccess {
+                    Toast.makeText(app, "已开始全书翻译《${cb.title ?: "未命名"}》（云端）", Toast.LENGTH_SHORT).show()
+                    reload()
+                }
+                .onFailure { Toast.makeText(app, "翻译失败：${it.message}", Toast.LENGTH_LONG).show() }
+        }
+    }
+
+    /** 停止云端书（未下载）的后台翻译任务。 */
+    fun doStopCloud(cb: CloudBook) {
+        scope.launch {
+            runCatching { app.api.cancelBookJobs(cb.id) }
+            reload()
         }
     }
 
@@ -353,12 +374,15 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
                 if (tab == 3) {
                     ProgressList(
                         books = books,
+                        cloudBooks = cloudBooks,
                         serverBooks = serverBooks,
                         error = progressErr,
                         translatingBookId = app.translatingBookId,
                         translatingProgress = app.translatingProgress,
                         queuedBookIds = app.queuedBookIds.toSet(),
+                        progressHistory = app.progressHistory,
                         onStop = { app.stopTranslatingIf(it.id) },
+                        onStopCloud = { doStopCloud(it) },
                     )
                 } else {
                     val cloudIds = cloudBooks.map { it.id }.toSet()
@@ -396,6 +420,8 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
                         onCancelSync = { doCancelSync(it) },
                         onDownloadCloud = { doDownloadCloud(it) },
                         onDeleteCloud = { doDeleteCloud(it) },
+                        onTranslateAllCloud = { doTranslateAllCloud(it) },
+                        onMoveCloud = { moveCloudTarget = it },
                         translatingBookId = app.translatingBookId,
                         translatingProgress = app.translatingProgress,
                         queuedBookIds = app.queuedBookIds.toSet(),
@@ -410,10 +436,29 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit) {
     // ---- 移动对话框 ----
     moveTarget?.let { book ->
         MoveBookDialog(
-            book = book,
+            title = book.title,
+            inFolder = book.folderId != null,
             folders = folders,
-            onMove = { fid -> scope.launch { app.library.moveBook(book.id, fid); reload() }; moveTarget = null },
+            onMove = { folder -> scope.launch { app.library.moveBook(book.id, folder?.id); reload() }; moveTarget = null },
             onDismiss = { moveTarget = null },
+        )
+    }
+
+    // ---- 移动云端书对话框（按云端收藏夹名同步）----
+    moveCloudTarget?.let { cb ->
+        MoveBookDialog(
+            title = cb.title ?: "未命名",
+            inFolder = !cb.folder.isNullOrBlank(),
+            folders = folders,
+            onMove = { folder ->
+                scope.launch {
+                    runCatching { app.api.cloudUpdateFolder(cb.id, folder?.name) }
+                        .onSuccess { reload() }
+                        .onFailure { e -> Toast.makeText(app, "移动失败：${e.message}", Toast.LENGTH_LONG).show() }
+                }
+                moveCloudTarget = null
+            },
+            onDismiss = { moveCloudTarget = null },
         )
     }
 
@@ -560,6 +605,8 @@ private fun LibraryTab(
     onCancelSync: (Book) -> Unit,
     onDownloadCloud: (CloudBook) -> Unit,
     onDeleteCloud: (CloudBook) -> Unit,
+    onTranslateAllCloud: (CloudBook) -> Unit,
+    onMoveCloud: (CloudBook) -> Unit,
     translatingBookId: String?,
     translatingProgress: Pair<Int, Int>?,
     queuedBookIds: Set<String>,
@@ -626,7 +673,7 @@ private fun LibraryTab(
                     )
                 }
                 gridItems(inCloud, key = { it.id }) { cb ->
-                    CloudCell(cb, syncing = syncing, onDownload = { onDownloadCloud(cb) }, onDelete = { onDeleteCloud(cb) })
+                    CloudCell(cb, syncing = syncing, onDownload = { onDownloadCloud(cb) }, onDelete = { onDeleteCloud(cb) }, onTranslateAll = { onTranslateAllCloud(cb) }, onMove = { onMoveCloud(cb) })
                 }
             }
         } else {
@@ -656,7 +703,7 @@ private fun LibraryTab(
                     )
                 }
                 listItems(inCloud, key = { it.id }) { cb ->
-                    CloudRow(cb, syncing = syncing, onDownload = { onDownloadCloud(cb) }, onDelete = { onDeleteCloud(cb) })
+                    CloudRow(cb, syncing = syncing, onDownload = { onDownloadCloud(cb) }, onDelete = { onDeleteCloud(cb) }, onTranslateAll = { onTranslateAllCloud(cb) }, onMove = { onMoveCloud(cb) })
                 }
             }
         }
@@ -743,7 +790,7 @@ private fun LibraryTab(
                     )
                 }
                 gridItems(cloudUnfiled, key = { it.id }) { cb ->
-                    CloudCell(cb, syncing = syncing, onDownload = { onDownloadCloud(cb) }, onDelete = { onDeleteCloud(cb) })
+                    CloudCell(cb, syncing = syncing, onDownload = { onDownloadCloud(cb) }, onDelete = { onDeleteCloud(cb) }, onTranslateAll = { onTranslateAllCloud(cb) }, onMove = { onMoveCloud(cb) })
                 }
             }
             if (unFiled.isEmpty() && localBooks.isEmpty() && cloudOnly.isEmpty() && folders.isNotEmpty()) {
@@ -823,7 +870,7 @@ private fun LibraryTab(
                     )
                 }
                 listItems(cloudUnfiled, key = { it.id }) { cb ->
-                    CloudRow(cb, syncing = syncing, onDownload = { onDownloadCloud(cb) }, onDelete = { onDeleteCloud(cb) })
+                    CloudRow(cb, syncing = syncing, onDownload = { onDownloadCloud(cb) }, onDelete = { onDeleteCloud(cb) }, onTranslateAll = { onTranslateAllCloud(cb) }, onMove = { onMoveCloud(cb) })
                 }
             }
             if (unFiled.isEmpty() && localBooks.isEmpty() && cloudOnly.isEmpty() && folders.isNotEmpty()) {
@@ -1125,6 +1172,8 @@ private fun CloudCell(
     cloud: CloudBook,
     onDownload: () -> Unit,
     onDelete: () -> Unit,
+    onTranslateAll: () -> Unit = {},
+    onMove: () -> Unit = {},
     syncing: SyncTask? = null,
 ) {
     val app = LocalContext.current.applicationContext as ReaderApp
@@ -1139,6 +1188,7 @@ private fun CloudCell(
             Modifier.fillMaxWidth().aspectRatio(0.72f)
                 .clip(MaterialTheme.shapes.small)
                 .background(MaterialTheme.colorScheme.surfaceVariant)
+                .combinedClickable(onClick = {}, onLongClick = onMove)
         ) {
             if (coverReady && coverFile.exists()) {
                 AsyncImage(
@@ -1174,7 +1224,9 @@ private fun CloudCell(
                         .padding(4.dp),
                 )
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                    DropdownMenuItem(text = { Text("全书翻译") }, onClick = { menuOpen = false; onTranslateAll() })
                     DropdownMenuItem(text = { Text("下载到本地") }, onClick = { menuOpen = false; onDownload() })
+                    DropdownMenuItem(text = { Text("移动到收藏夹…") }, onClick = { menuOpen = false; onMove() })
                     DropdownMenuItem(text = { Text("删除云端") }, onClick = { menuOpen = false; onDelete() })
                 }
             }
@@ -1287,13 +1339,15 @@ private fun CloudRow(
     cloud: CloudBook,
     onDownload: () -> Unit,
     onDelete: () -> Unit,
+    onTranslateAll: () -> Unit = {},
+    onMove: () -> Unit = {},
     syncing: SyncTask? = null,
 ) {
     val app = LocalContext.current.applicationContext as ReaderApp
     var coverReady by remember { mutableStateOf(false) }
     LaunchedEffect(cloud.id) { app.library.ensureCloudCover(cloud.id); coverReady = true }
     val coverFile = app.library.cloudCoverFile(cloud.id)
-    Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(Modifier.fillMaxWidth().combinedClickable(onClick = {}, onLongClick = onMove).padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
         Box(
             Modifier.size(width = 40.dp, height = 56.dp).clip(MaterialTheme.shapes.small)
                 .background(MaterialTheme.colorScheme.surfaceVariant),
@@ -1322,7 +1376,9 @@ private fun CloudRow(
                 modifier = Modifier.clip(CircleShape).clickable { menuOpen = true }.padding(4.dp),
             )
             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                DropdownMenuItem(text = { Text("全书翻译") }, onClick = { menuOpen = false; onTranslateAll() })
                 DropdownMenuItem(text = { Text("下载到本地") }, onClick = { menuOpen = false; onDownload() })
+                DropdownMenuItem(text = { Text("移动到收藏夹…") }, onClick = { menuOpen = false; onMove() })
                 DropdownMenuItem(text = { Text("删除云端") }, onClick = { menuOpen = false; onDelete() })
             }
         }
@@ -1332,16 +1388,17 @@ private fun CloudRow(
 /** 移动书到收藏夹（或移出）：带搜索框 + 可滚动列表，收藏夹多时不撑破屏幕。 */
 @Composable
 private fun MoveBookDialog(
-    book: Book,
+    title: String,
+    inFolder: Boolean,
     folders: List<Folder>,
-    onMove: (String?) -> Unit,
+    onMove: (Folder?) -> Unit,
     onDismiss: () -> Unit,
 ) {
     var query by remember { mutableStateOf("") }
     val filtered = folders.filter { query.isBlank() || it.name.contains(query, ignoreCase = true) }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("移动《${book.title}》到…") },
+        title = { Text("移动《$title》到…") },
         text = {
             Column {
                 OutlinedTextField(
@@ -1387,7 +1444,7 @@ private fun MoveBookDialog(
                                     }
                                 },
                         ) {
-                            if (book.folderId != null && query.isBlank()) {
+                            if (inFolder && query.isBlank()) {
                                 Row(
                                     Modifier.fillMaxWidth().clickable { onMove(null) }.padding(vertical = 12.dp, horizontal = 4.dp),
                                     verticalAlignment = Alignment.CenterVertically,
@@ -1397,7 +1454,7 @@ private fun MoveBookDialog(
                             }
                             filtered.forEach { f ->
                                 Row(
-                                    Modifier.fillMaxWidth().clickable { onMove(f.id) }.padding(vertical = 12.dp, horizontal = 4.dp),
+                                    Modifier.fillMaxWidth().clickable { onMove(f) }.padding(vertical = 12.dp, horizontal = 4.dp),
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
                                     Text(f.name, style = MaterialTheme.typography.bodyLarge, maxLines = 1)
@@ -1507,16 +1564,19 @@ private fun RenameBookDialog(
     )
 }
 
-/** 翻译进度列表：本地书 + 服务端 done/failed 汇总 + 正在翻译的实时进度。 */
+/** 翻译进度列表：本地书 + 云端书（未下载） + 服务端 done/failed/active 汇总。 */
 @Composable
 private fun ProgressList(
     books: List<Book>,
+    cloudBooks: List<CloudBook>,
     serverBooks: List<ServerBook>,
     error: String?,
     translatingBookId: String?,
     translatingProgress: Pair<Int, Int>?,
     queuedBookIds: Set<String>,
+    progressHistory: Map<String, Pair<Int, Int>>,
     onStop: (Book) -> Unit,
+    onStopCloud: (CloudBook) -> Unit,
 ) {
     if (error != null) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -1524,7 +1584,7 @@ private fun ProgressList(
         }
         return
     }
-    if (books.isEmpty()) {
+    if (books.isEmpty() && cloudBooks.isEmpty()) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Text("暂无书籍", color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
@@ -1535,9 +1595,15 @@ private fun ProgressList(
     val visibleBooks = books.filter { book ->
         translatingBookId == book.id ||
             book.id in queuedBookIds ||
+            (progressHistory[book.id]?.first ?: 0) > 0 ||
             (serverMap[book.serverId]?.let { it.donePages + it.failedPages > 0 } == true)
     }
-    if (visibleBooks.isEmpty()) {
+    // 云端书（未下载到本地）里有翻译进度/在跑的
+    val visibleCloud = cloudBooks.filter { cb ->
+        books.none { it.cloudId == cb.id } &&
+            serverMap[cb.id]?.let { it.donePages + it.failedPages > 0 || it.activeJobs > 0 } == true
+    }
+    if (visibleBooks.isEmpty() && visibleCloud.isEmpty()) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Text("还没有翻译过的书", color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
@@ -1552,7 +1618,9 @@ private fun ProgressList(
             val s = serverMap[book.serverId]
             val isRunning = translatingBookId == book.id
             val isQueued = book.id in queuedBookIds
-            val done = if (isRunning) (translatingProgress?.first ?: 0) else (s?.donePages ?: 0)
+            val hist = progressHistory[book.id]
+            val done = if (isRunning) (translatingProgress?.first ?: hist?.first ?: 0)
+                       else (hist?.first ?: s?.donePages ?: 0)
             val failed = s?.failedPages ?: 0
             val total = book.pageCount
             val status = when {
@@ -1563,6 +1631,34 @@ private fun ProgressList(
                 else -> ""   // 部分翻译但没在跑：不显示状态，只显示页数
             }
             BookProgressRow(book.title, status, done, failed, total, isRunning, isQueued, onStop = { onStop(book) })
+        }
+        if (visibleCloud.isNotEmpty()) {
+            item {
+                Text(
+                    "云端（未下载）",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(vertical = 6.dp),
+                )
+            }
+            listItems(visibleCloud, key = { "cloud-${it.id}" }) { cb ->
+                val s = serverMap[cb.id]
+                val done = s?.donePages ?: 0
+                val failed = s?.failedPages ?: 0
+                val total = cb.pageCount ?: 0
+                val isRunning = (s?.activeJobs ?: 0) > 0
+                val status = when {
+                    isRunning -> "进行中"
+                    total > 0 && done >= total && failed == 0 -> "已完成"
+                    failed > 0 && done + failed >= total -> "部分失败"
+                    else -> ""
+                }
+                BookProgressRow(
+                    cb.title ?: "未命名", status, done, failed, total, isRunning, false,
+                    cloud = true,
+                    onStop = { onStopCloud(cb) },
+                )
+            }
         }
     }
 }
@@ -1576,10 +1672,15 @@ private fun BookProgressRow(
     total: Int,
     isRunning: Boolean,
     isQueued: Boolean,
+    cloud: Boolean = false,
     onStop: () -> Unit,
 ) {
     Column(Modifier.fillMaxWidth()) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            if (cloud) {
+                Text("☁", color = Color(0xFF43A047), style = MaterialTheme.typography.bodyMedium)
+                Spacer(Modifier.width(4.dp))
+            }
             Text(title, maxLines = 1, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
             if (status.isNotEmpty()) {
                 Text(

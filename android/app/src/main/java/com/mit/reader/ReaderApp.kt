@@ -4,6 +4,7 @@ import android.app.Application
 import android.widget.Toast
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.mit.reader.data.Book
@@ -45,6 +46,8 @@ class ReaderApp : Application() {
     val queuedBookIds: List<String> get() = translateQueue.drop(1)
     var translatingProgress by mutableStateOf<Pair<Int, Int>?>(null)
         private set
+    /** 每本书最后一次已知的翻译进度 (done, total)：停止/完成后保留，进度页用，避免停止后进度消失或回跳。 */
+    val progressHistory = mutableStateMapOf<String, Pair<Int, Int>>()
     /** 后台同步云端译文到本地时置 true（书库主页显示小转圈）。 */
     var syncingTranslations by mutableStateOf(false)
         private set
@@ -142,9 +145,12 @@ class ReaderApp : Application() {
             return
         }
         stopRequested = false
-        translatingProgress = 0 to book.pageCount
+        translatingProgress = null   // 真实进度由 translateWholeBook 查完服务端后设置，不闪 0
         try {
-            val done = translateWholeBook(book) { d, t -> translatingProgress = d to t }
+            val done = translateWholeBook(book) { d, t ->
+                translatingProgress = d to t
+                progressHistory[book.id] = d to t
+            }
             val msg = if (done >= book.pageCount) "《${book.title}》翻译完成"
             else "《${book.title}》翻译完成 $done/${book.pageCount} 页（失败页可在阅读器内重试）"
             Toast.makeText(this@ReaderApp, msg, Toast.LENGTH_LONG).show()
@@ -191,12 +197,15 @@ class ReaderApp : Application() {
      */
     private suspend fun translateWholeBook(book: Book, onProgress: (Int, Int) -> Unit): Int {
         val total = book.pageCount
-        onProgress(0, total)
-
         val serverId = book.serverId
         val upKey = "uploaded_${book.id}"   // 每本书独立的上传标记，避免 A 书中断影响 B 书
+
+        // 先查服务端已有页，用真实进度初始化（避免「先闪 0 再跳真实值」）
+        val existing = runCatching { api.bookPages(serverId) }.getOrDefault(emptyList()).associateBy { it.pageIndex }
+        var lastDone = existing.values.count { it.status == "done" }
+        onProgress(lastDone, total)
+
         if (!prefs.getBoolean(upKey, false)) {
-            val existing = api.bookPages(serverId).associateBy { it.pageIndex }
             val pending = (0 until total).filter { existing[it]?.status != "done" }
             if (pending.isNotEmpty()) {
                 val orderDir = if (book.mode == ReadingMode.MANGA) "rtl" else "ltr"
@@ -212,7 +221,6 @@ class ReaderApp : Application() {
             prefs.edit().putBoolean(upKey, true).apply()
         }
 
-        var lastDone = -1
         while (true) {
             if (stopRequested) throw CancellationException("用户停止")
             val pages = api.bookPages(serverId)
