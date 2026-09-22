@@ -427,6 +427,13 @@ class MangaTranslator:
                                   for i, r in enumerate(ctx.text_regions)}
             self._original_page_texts.append(page_original_texts)
 
+            # 防内存泄漏：跨页上下文最多用 context_size 页，这里只保留最近 N 页，避免无界累积
+            _max_ctx_pages = max(self.context_size * 2 + 2, 20)
+            if len(self.all_page_translations) > _max_ctx_pages:
+                _excess = len(self.all_page_translations) - _max_ctx_pages
+                del self.all_page_translations[:_excess]
+                del self._original_page_texts[:_excess]
+
         return ctx
 
     async def _translate(self, config: Config, ctx: Context) -> Context:
@@ -1687,6 +1694,13 @@ class MangaTranslator:
                 page_original_texts = {i: (r.text_raw if hasattr(r, "text_raw") else r.text)
                                       for i, r in enumerate(ctx.text_regions)}
                 self._original_page_texts.append(page_original_texts)
+
+        # 防内存泄漏：只保留最近 N 页上下文
+        _max_ctx_pages = max(self.context_size * 2 + 2, 20)
+        if len(self.all_page_translations) > _max_ctx_pages:
+            _excess = len(self.all_page_translations) - _max_ctx_pages
+            del self.all_page_translations[:_excess]
+            del self._original_page_texts[:_excess]
 
         # 清理批量处理的图片上下文缓存
         self._saved_image_contexts.clear()

@@ -70,4 +70,6 @@ dependencies {
     // 网络：multipart 上传 / JSON / job 轮询
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    // SAF 文件夹访问（书库文件夹自动扫描导入）
+    implementation("androidx.documentfile:documentfile:1.0.1")
 }

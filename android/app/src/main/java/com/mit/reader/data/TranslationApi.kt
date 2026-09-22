@@ -29,6 +29,7 @@ data class ServerBook(
     val donePages: Int,
     val failedPages: Int,
     val activeJobs: Int = 0,
+    val jobStatus: String? = null,
 )
 data class CloudUploadResp(val bookId: String, val existed: Boolean)
 data class CloudBook(
@@ -125,6 +126,7 @@ class TranslationApi {
                         donePages = o.optInt("done_pages", 0),
                         failedPages = o.optInt("failed_pages", 0),
                         activeJobs = o.optInt("active_jobs", 0),
+                        jobStatus = if (o.isNull("job_status")) null else o.optString("job_status").takeIf { it.isNotBlank() },
                     )
                 }
             }
@@ -317,6 +319,20 @@ class TranslationApi {
             CloudUploadResp(j.getString("book_id"), j.optBoolean("existed", false))
         }
     }
+
+    /** 按内容 hash 查云端是否已有同内容书，返回 cloudId（无则 null）。 */
+    suspend fun cloudLookup(hash: String): String? =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            if (hash.isBlank()) return@withContext null
+            val req = Request.Builder().url("$base/v1/cloud/books/lookup?hash=$hash").authed().build()
+            runCatching {
+                client.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@runCatching null
+                    val j = JSONObject(resp.body?.string().orEmpty())
+                    if (j.isNull("book_id")) null else j.optString("book_id").takeIf { it.isNotBlank() }
+                }
+            }.getOrNull()
+        }
 
     /** 拉当前账号的云端书列表。 */
     suspend fun cloudList(): List<CloudBook> = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {

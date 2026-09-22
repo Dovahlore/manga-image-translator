@@ -3,11 +3,13 @@ package com.mit.reader.data
 import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
+import androidx.documentfile.provider.DocumentFile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.InputStream
 import java.security.MessageDigest
 import java.util.UUID
 import java.util.zip.ZipEntry
@@ -31,14 +33,25 @@ class LibraryRepository(private val context: Context) {
     suspend fun book(id: String): Book? = withContext(Dispatchers.IO) { readIndexData().books.find { it.id == id } }
 
     suspend fun import(uri: Uri): Book = withContext(Dispatchers.IO) {
+        val name = displayNameOf(uri)
+        val input = context.contentResolver.openInputStream(uri)
+            ?: throw IllegalStateException("无法读取所选文件")
+        importFromStream(input, name)
+    }
+
+    /** 从本地文件导入（书库默认文件夹 / WebView 下载后的文件用）。 */
+    suspend fun importFile(file: File): Book = withContext(Dispatchers.IO) {
+        importFromStream(file.inputStream(), file.name)
+    }
+
+    private suspend fun importFromStream(input: InputStream, name: String?): Book {
         val id = UUID.randomUUID().toString()
         val dir = File(root, id).apply { mkdirs() }
         val src = File(dir, "book.src")
         // 书名优先用「文件名」——那才是用户在文件管理器里认得的名字；
         // 书内部元数据的标题常常和文件名对不上（比如 [Kmoe][尼古喵喵]卷01 内部叫「雅尼貓 - 卷01」）
-        val fromName = titleFromFileName(displayNameOf(uri))
-        context.contentResolver.openInputStream(uri)?.use { it.copyTo(src.outputStream()) }
-            ?: throw IllegalStateException("无法读取所选文件")
+        val fromName = titleFromFileName(name)
+        input.use { it.copyTo(src.outputStream()) }
 
         val r = when (sniffFormat(src)) {
             "mobi" -> MobiParser.extract(src, dir)
@@ -50,8 +63,10 @@ class LibraryRepository(private val context: Context) {
         // 去重：同样源文件哈希的书已存在 → 直接返回已存在的那本，删掉刚导入的副本
         d.books.firstOrNull { it.hash.isNotEmpty() && it.hash == hash }?.let { existing ->
             dir.deleteRecursively()
-            return@withContext existing
+            return existing
         }
+        // 云端识别：同 hash 的云端书直接挂 cloudId（丢进 BOOKS 的、和云端同 hash 的书 → 识别成云端书）
+        val cloudId = runCatching { api.cloudLookup(hash) }.getOrNull()
         val book = Book(
             id = id,
             title = fromName.ifBlank { r.title },
@@ -61,11 +76,76 @@ class LibraryRepository(private val context: Context) {
             pageFiles = r.pages,
             hash = hash,
             fingerprint = fp,
+            cloudId = cloudId,
             createdAt = System.currentTimeMillis(),
         )
         writeIndex(d.books + book, d.folders)
-        book
+        return book
     }
+
+    /** 默认书库文件夹（App 自己的外部存储 books 目录，安装即存在、无需授权）。 */
+    fun defaultBooksDir(): File = File(context.getExternalFilesDir(null), "books").apply { mkdirs() }
+
+    /** 下载一个文件到默认书库文件夹（WebView 下载用），返回落盘文件。 */
+    suspend fun downloadToBooks(url: String, filename: String): File = withContext(Dispatchers.IO) {
+        val safeName = filename.substringAfterLast('/').ifBlank { "download_${System.currentTimeMillis()}" }
+        val f = File(defaultBooksDir(), safeName)
+        api.download(url, f)
+        f
+    }
+
+    /** 扫描「用户选的书库文件夹」（SAF）里的 epub/mobi，导入新书（按内容 hash 去重）。
+     *  默认书库文件夹（App 私有）不扫：WebView 下载后已直接导入，那里只是暂存。 */
+    suspend fun scanLibraryFolder(): Int = withContext(Dispatchers.IO) {
+        var imported = 0
+        val uriStr = ServerConfig.libraryFolderUri
+        if (uriStr.isNullOrBlank()) return@withContext 0
+        val folder = runCatching { DocumentFile.fromTreeUri(context, Uri.parse(uriStr)) }.getOrNull()
+            ?: return@withContext 0
+        for (f in folder.listFiles()) {
+            if (!f.isFile) continue
+            val name = f.name ?: continue
+            if (!name.endsWith(".epub", ignoreCase = true) && !name.endsWith(".mobi", ignoreCase = true)) continue
+            runCatching { import(f.uri) }
+                .onSuccess { book ->
+                    imported++
+                    recordSourceFile(book.hash, name)
+                }
+        }
+        imported
+    }
+
+    private val sourcePrefs get() = context.getSharedPreferences("source_files", Context.MODE_PRIVATE)
+
+    private fun sourceFiles(): MutableMap<String, String> {
+        val raw = sourcePrefs.getString("map", null) ?: return mutableMapOf()
+        return runCatching {
+            val o = JSONObject(raw)
+            val m = mutableMapOf<String, String>()
+            o.keys().forEach { k -> m[k] = o.optString(k) }
+            m
+        }.getOrDefault(mutableMapOf())
+    }
+
+    private fun persistSourceFiles(map: Map<String, String>) {
+        val o = JSONObject()
+        map.forEach { (k, v) -> o.put(k, v) }
+        sourcePrefs.edit().putString("map", o.toString()).apply()
+    }
+
+    private fun recordSourceFile(hash: String, name: String) {
+        val m = sourceFiles()
+        m[hash] = name
+        persistSourceFiles(m)
+    }
+
+    private fun removeSourceFile(hash: String) {
+        val m = sourceFiles()
+        m.remove(hash)
+        persistSourceFiles(m)
+    }
+
+    private fun sourceFileName(hash: String): String? = sourceFiles()[hash]
 
     /** 取 ContentResolver 里的原始文件名（例：[Kmoe][尼古喵喵]卷01.epub）。 */
     private fun displayNameOf(uri: Uri): String? = runCatching {
@@ -108,6 +188,36 @@ class LibraryRepository(private val context: Context) {
         File(translatedRoot, id).deleteRecursively()
         val d = readIndexData()
         writeIndex(d.books.filterNot { it.id == id }, d.folders)
+    }
+
+    /** 删书时同步删除源文件（默认书库文件夹 + SAF 文件夹都查，按内容 hash 定位文件名）。 */
+    suspend fun deleteSourceFile(hash: String): Boolean = withContext(Dispatchers.IO) {
+        if (hash.isBlank()) return@withContext false
+        val targetName = sourceFileName(hash) ?: return@withContext false
+
+        // 1) 默认书库文件夹
+        val f1 = File(defaultBooksDir(), targetName)
+        if (f1.exists()) {
+            val ok = f1.delete()
+            if (ok) removeSourceFile(hash)
+            return@withContext ok
+        }
+
+        // 2) SAF 文件夹
+        val uriStr = ServerConfig.libraryFolderUri
+        if (!uriStr.isNullOrBlank()) {
+            val folder = runCatching { DocumentFile.fromTreeUri(context, Uri.parse(uriStr)) }.getOrNull()
+            if (folder != null) {
+                for (f in folder.listFiles()) {
+                    if (f.isFile && f.name == targetName) {
+                        val ok = runCatching { f.delete() }.getOrDefault(false)
+                        if (ok) removeSourceFile(hash)
+                        return@withContext ok
+                    }
+                }
+            }
+        }
+        false
     }
 
     suspend fun setMode(id: String, mode: ReadingMode) = withContext(Dispatchers.IO) {
@@ -195,12 +305,12 @@ class LibraryRepository(private val context: Context) {
         readIndexData().books.find { it.id == book.id } ?: book
     }
 
-    /** 取消同步：删云端（含翻译结果），本地保留，清空 cloudId。 */
+    /** 取消同步：删云端（含翻译结果），本地保留，清空 cloudId。
+     *  云端删除失败（离线/网络）会抛异常，由调用方处理；此时本地 cloudId 不清，书仍算已同步，可稍后重试。 */
     suspend fun cancelSync(book: Book): Book = withContext(Dispatchers.IO) {
-        book.cloudId?.let {
-            runCatching { api.cloudDelete(it) }
-            cloudCoverFile(it).delete()
-        }
+        val cloudId = book.cloudId ?: return@withContext book
+        api.cloudDelete(cloudId)   // 失败抛异常，不吞掉
+        cloudCoverFile(cloudId).delete()
         val d = readIndexData()
         writeIndex(d.books.map { if (it.id == book.id) it.copy(cloudId = null) else it }, d.folders)
         readIndexData().books.find { it.id == book.id } ?: book

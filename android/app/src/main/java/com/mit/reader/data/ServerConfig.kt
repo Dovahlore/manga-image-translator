@@ -12,6 +12,8 @@ object ServerConfig {
     private const val PREFS = "server"
     private const val KEY_URL = "base_url"
     private const val KEY_KEY = "api_key"
+    private const val KEY_LIB_FOLDER = "library_folder_uri"
+    private const val KEY_LIB_FOLDER_NAME = "library_folder_name"
 
     private var prefs: SharedPreferences? = null
 
@@ -30,5 +32,19 @@ object ServerConfig {
         get() = prefs?.getString(KEY_KEY, "")?.trim().orEmpty()
         set(value) {
             prefs?.edit()?.putString(KEY_KEY, value.trim())?.apply()
+        }
+
+    /** 书库文件夹（SAF 树 URI，用于自动扫描导入 epub/mobi）。 */
+    var libraryFolderUri: String?
+        get() = prefs?.getString(KEY_LIB_FOLDER, null)
+        set(value) {
+            prefs?.edit()?.putString(KEY_LIB_FOLDER, value)?.apply()
+        }
+
+    /** 书库文件夹的显示名（方便设置页展示）。 */
+    var libraryFolderName: String?
+        get() = prefs?.getString(KEY_LIB_FOLDER_NAME, null)
+        set(value) {
+            prefs?.edit()?.putString(KEY_LIB_FOLDER_NAME, value)?.apply()
         }
 }

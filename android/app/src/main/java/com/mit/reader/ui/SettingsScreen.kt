@@ -1,5 +1,8 @@
 package com.mit.reader.ui
 
+import android.content.Intent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -29,6 +32,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.documentfile.provider.DocumentFile
 import com.mit.reader.ReaderApp
 import com.mit.reader.data.ServerConfig
 import kotlinx.coroutines.launch
@@ -37,11 +41,27 @@ import kotlinx.coroutines.launch
 @Composable
 fun SettingsScreen(onBack: () -> Unit) {
     val app = LocalContext.current.applicationContext as ReaderApp
+    val context = LocalContext.current
     var url by remember { mutableStateOf(ServerConfig.baseUrl) }
     var key by remember { mutableStateOf(ServerConfig.apiKey) }
     var result by remember { mutableStateOf("") }
     var usageText by remember { mutableStateOf("") }
+    var folderName by remember { mutableStateOf(ServerConfig.libraryFolderName) }
+    var scanResult by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
+
+    // 书库文件夹选择（SAF 树）：拿到权限后持久化，重启不失效
+    val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            runCatching { context.contentResolver.takePersistableUriPermission(uri, flags) }
+            ServerConfig.libraryFolderUri = uri.toString()
+            val name = runCatching { DocumentFile.fromTreeUri(context, uri)?.name }.getOrNull()
+            ServerConfig.libraryFolderName = name
+            folderName = name
+            scanResult = if (name != null) "已选择：$name" else "已选择文件夹"
+        }
+    }
 
     LaunchedEffect(Unit) {
         val sb = StringBuilder()
@@ -139,6 +159,37 @@ fun SettingsScreen(onBack: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 8.dp),
             )
+
+            // ---- 书库文件夹（自动扫描导入 epub/mobi）----
+            Text(
+                "书库文件夹（自动扫描导入）",
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.padding(top = 24.dp),
+            )
+            Text(
+                if (folderName.isNullOrBlank()) "未选择：点「选择文件夹」指定一个目录，App 会自动扫描其中的 .epub / .mobi 并导入（按内容去重）。"
+                else "当前：$folderName",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 8.dp),
+            )
+            Row(Modifier.padding(top = 8.dp)) {
+                Button(onClick = { folderPicker.launch(null) }, modifier = Modifier.weight(1f)) { Text("选择文件夹") }
+                Button(
+                    onClick = {
+                        scanResult = "扫描中…"
+                        scope.launch {
+                            val n = runCatching { app.library.scanLibraryFolder() }.getOrDefault(-1)
+                            scanResult = if (n >= 0) "扫描完成，新导入 $n 本" else "扫描失败（离线或无法访问文件夹）"
+                        }
+                    },
+                    enabled = !ServerConfig.libraryFolderUri.isNullOrBlank(),
+                    modifier = Modifier.weight(1f).padding(start = 8.dp),
+                ) { Text("重新扫描") }
+            }
+            if (scanResult.isNotBlank()) {
+                Text(scanResult, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
+            }
         }
     }
 }

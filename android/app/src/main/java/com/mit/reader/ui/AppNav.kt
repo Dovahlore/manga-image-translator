@@ -11,6 +11,7 @@ sealed class Route(val path: String) {
         fun of(bookId: String) = "reader/$bookId"
     }
     data object Settings : Route("settings")
+    data object Kmoe : Route("kmoe")
 }
 
 @Composable
@@ -21,6 +22,7 @@ fun AppNav() {
             LibraryScreen(
                 onOpen = { id -> nav.navigate(Route.Reader.of(id)) },
                 onSettings = { nav.navigate(Route.Settings.path) },
+                onKmoe = { nav.navigate(Route.Kmoe.path) },
             )
         }
         composable(Route.Reader.path) { backStack ->
@@ -29,6 +31,9 @@ fun AppNav() {
         }
         composable(Route.Settings.path) {
             SettingsScreen(onBack = { nav.popBackStack() })
+        }
+        composable(Route.Kmoe.path) {
+            KmoeScreen(onBack = { nav.popBackStack() })
         }
     }
 }

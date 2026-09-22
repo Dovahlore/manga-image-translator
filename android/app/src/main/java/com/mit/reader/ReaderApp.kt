@@ -51,6 +51,9 @@ class ReaderApp : Application() {
     /** 后台同步云端译文到本地时置 true（书库主页显示小转圈）。 */
     var syncingTranslations by mutableStateOf(false)
         private set
+    /** 服务器是否可达（书库/进度页顶栏显示绿点=在线 / 红点=离线）。 */
+    var serverOnline by mutableStateOf(true)
+        private set
 
     /** 每下好一页译文图就发一次事件 (bookId, pageIndex)：阅读器按书订阅，免轮询。 */
     private val _pageTranslated = MutableSharedFlow<Pair<String, Int>>(extraBufferCapacity = 64)
@@ -62,16 +65,35 @@ class ReaderApp : Application() {
         library = LibraryRepository(this)
         resumeTranslatingBook()
         startBackgroundSync()
+        startConnectivityMonitor()
+    }
+
+    /** 每 30 秒 ping 一次服务器，更新在线状态。 */
+    private fun startConnectivityMonitor() {
+        appScope.launch {
+            while (true) {
+                serverOnline = api.ping().startsWith("OK")
+                delay(30 * 1000)
+            }
+        }
     }
 
     /** 打开 App + 定时后台同步：给所有书补拉缺失/变化的译文页（同步书别的设备新翻的、非同步书服务端已翻好的）。
      *  只补差异，不全量，避免卡顿。 */
     private fun startBackgroundSync() {
         appScope.launch {
-            delay(1000)
+            delay(1500)
+            // 打开时：先扫书库文件夹（识别云端书），再同步（把识别成云端书后缺的远程译文拉下来）
+            runCatching { library.scanLibraryFolder() }
+            runCatching { drainPendingDeletes() }
+            runCatching { drainPendingCancels() }
+            runCatching { syncAllBooks() }
+            // 之后每 5 分钟只同步（不再扫文件夹）
             while (true) {
-                runCatching { syncAllBooks() }
                 delay(5 * 60 * 1000)
+                runCatching { drainPendingDeletes() }
+                runCatching { drainPendingCancels() }
+                runCatching { syncAllBooks() }
             }
         }
     }
@@ -89,6 +111,72 @@ class ReaderApp : Application() {
         } finally {
             syncingTranslations = false
         }
+    }
+
+    // ---- 离线删书补删：删本地时服务端删除失败（离线/网络抖），记下 book id，下次在线补删，避免 DB 残留 ----
+
+    private fun pendingDeletes(): MutableList<String> {
+        val raw = prefs.getString("pending_deletes", null) ?: return mutableListOf()
+        return runCatching {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).map { arr.getString(it) }.toMutableList()
+        }.getOrDefault(mutableListOf())
+    }
+
+    private fun persistPendingDeletes(list: List<String>) {
+        val arr = JSONArray()
+        list.forEach { arr.put(it) }
+        prefs.edit().putString("pending_deletes", arr.toString()).apply()
+    }
+
+    fun recordPendingDelete(serverBookId: String) {
+        val list = pendingDeletes()
+        if (serverBookId !in list) list.add(serverBookId)
+        persistPendingDeletes(list)
+    }
+
+    private suspend fun drainPendingDeletes() {
+        val ids = pendingDeletes()
+        if (ids.isEmpty()) return
+        val remaining = mutableListOf<String>()
+        for (id in ids) {
+            val ok = runCatching { api.deleteBook(id) }.getOrDefault(false)
+            if (!ok) remaining.add(id)
+        }
+        persistPendingDeletes(remaining)
+    }
+
+    // ---- 离线停止补取消：点停止时服务端取消失败（离线），记下 book id，下次在线补取消，避免服务端继续翻 ----
+
+    private fun pendingCancels(): MutableList<String> {
+        val raw = prefs.getString("pending_cancels", null) ?: return mutableListOf()
+        return runCatching {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).map { arr.getString(it) }.toMutableList()
+        }.getOrDefault(mutableListOf())
+    }
+
+    private fun persistPendingCancels(list: List<String>) {
+        val arr = JSONArray()
+        list.forEach { arr.put(it) }
+        prefs.edit().putString("pending_cancels", arr.toString()).apply()
+    }
+
+    fun recordPendingCancel(serverBookId: String) {
+        val list = pendingCancels()
+        if (serverBookId !in list) list.add(serverBookId)
+        persistPendingCancels(list)
+    }
+
+    private suspend fun drainPendingCancels() {
+        val ids = pendingCancels()
+        if (ids.isEmpty()) return
+        val remaining = mutableListOf<String>()
+        for (id in ids) {
+            val ok = runCatching { api.cancelBookJobs(id) }.getOrDefault(false)
+            if (!ok) remaining.add(id)
+        }
+        persistPendingCancels(remaining)
     }
 
     /** 进程被杀后，下次打开时接着收尾队列里的书（服务端一直在翻，这里补下载）。 */
@@ -185,7 +273,10 @@ class ReaderApp : Application() {
         // 按书取消服务端所有 queued/running 任务：覆盖进程被杀后遗留的重复 job（孤儿任务）
         appScope.launch {
             val b = library.book(bookId)
-            if (b != null) runCatching { api.cancelBookJobs(b.serverId) }
+            if (b != null) {
+                val ok = runCatching { api.cancelBookJobs(b.serverId) }.getOrDefault(false)
+                if (!ok) recordPendingCancel(b.serverId)   // 离线/失败：记下，下次在线补取消
+            }
         }
     }
 
@@ -200,50 +291,67 @@ class ReaderApp : Application() {
         val serverId = book.serverId
         val upKey = "uploaded_${book.id}"   // 每本书独立的上传标记，避免 A 书中断影响 B 书
 
-        // 先查服务端已有页，用真实进度初始化（避免「先闪 0 再跳真实值」）
-        val existing = runCatching { api.bookPages(serverId) }.getOrDefault(emptyList()).associateBy { it.pageIndex }
-        var lastDone = existing.values.count { it.status == "done" }
-        onProgress(lastDone, total)
+        var lastDone = -1
+        var uploaded = prefs.getBoolean(upKey, false)
 
-        if (!prefs.getBoolean(upKey, false)) {
-            val pending = (0 until total).filter { existing[it]?.status != "done" }
-            if (pending.isNotEmpty()) {
-                val orderDir = if (book.mode == ReadingMode.MANGA) "rtl" else "ltr"
-                serverJobId = if (book.cloudId != null) {
-                    // 已同步：服务端从云端 zip 自取图，不上传页图
-                    api.translateAllFromZip(serverId, book.title, orderDir, pending)
-                } else {
-                    api.translateAll(serverId, book.title, orderDir, total, pending, pending.map { book.pageFiles[it] })
-                }
-                // 持久化 job_id，重启恢复后「停止」仍能取消服务端任务
-                serverJobId?.let { prefs.edit().putString("job_id", it).apply() }
-            }
-            prefs.edit().putBoolean(upKey, true).apply()
-        }
-
+        // 外层重试：网络错误（离线/服务端不可用）不退出、不把书移出队列，等几秒重试
         while (true) {
             if (stopRequested) throw CancellationException("用户停止")
-            val pages = api.bookPages(serverId)
-            var done = 0
-            for (p in pages) {
-                if (p.status == "done") {
-                    val f = library.translatedCacheFile(book.id, p.pageIndex)
-                    if (!f.exists() || f.length() == 0L) {
-                        // 容错：下载失败（如服务端文件还没落盘的瞬时 404）不打断整本，下一轮重试
-                        runCatching { library.downloadTranslatedPage(book.id, p.id, p.pageIndex) }
-                            .onSuccess { _pageTranslated.tryEmit(book.id to p.pageIndex) }
+            try {
+                val existing = api.bookPages(serverId).associateBy { it.pageIndex }
+                lastDone = existing.values.count { it.status == "done" }
+                onProgress(lastDone, total)
+
+                if (!uploaded) {
+                    val pending = (0 until total).filter { existing[it]?.status != "done" }
+                    if (pending.isNotEmpty()) {
+                        val orderDir = if (book.mode == ReadingMode.MANGA) "rtl" else "ltr"
+                        serverJobId = if (book.cloudId != null) {
+                            // 已同步：服务端从云端 zip 自取图，不上传页图
+                            api.translateAllFromZip(serverId, book.title, orderDir, pending)
+                        } else {
+                            api.translateAll(serverId, book.title, orderDir, total, pending, pending.map { book.pageFiles[it] })
+                        }
+                        // 持久化 job_id，重启恢复后「停止」仍能取消服务端任务
+                        serverJobId?.let { prefs.edit().putString("job_id", it).apply() }
                     }
-                    done++
+                    uploaded = true
+                    prefs.edit().putBoolean(upKey, true).apply()
                 }
+
+                // 轮询服务端进度，把翻好的页下载到本地缓存
+                while (true) {
+                    if (stopRequested) throw CancellationException("用户停止")
+                    val pages = api.bookPages(serverId)
+                    var done = 0
+                    for (p in pages) {
+                        if (p.status == "done") {
+                            val f = library.translatedCacheFile(book.id, p.pageIndex)
+                            if (!f.exists() || f.length() == 0L) {
+                                // 容错：下载失败（如服务端文件还没落盘的瞬时 404）不打断整本，下一轮重试
+                                runCatching { library.downloadTranslatedPage(book.id, p.id, p.pageIndex) }
+                                    .onSuccess { _pageTranslated.tryEmit(book.id to p.pageIndex) }
+                            }
+                            done++
+                        }
+                    }
+                    if (done != lastDone) {
+                        lastDone = done
+                        onProgress(done, total)
+                    }
+                    val settled = pages.count { it.status == "done" || it.status == "failed" }
+                    if (pages.size >= total && settled >= total) return lastDone
+                    delay(2000)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: java.io.IOException) {
+                // 网络错误/离线：等 5 秒重试，不退出、不把书移出队列（否则离线启动会把队列清空）
+                delay(5000)
+            } catch (e: Exception) {
+                // 其它错误（HTTP 4xx/5xx 等）：向上抛，让 runOne 显示失败
+                throw e
             }
-            if (done != lastDone) {
-                lastDone = done
-                onProgress(done, total)
-            }
-            val settled = pages.count { it.status == "done" || it.status == "failed" }
-            if (pages.size >= total && settled >= total) break
-            delay(2000)
         }
-        return lastDone
     }
 }

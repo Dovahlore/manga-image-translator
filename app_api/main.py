@@ -36,11 +36,11 @@ from . import settings as S
 _redis: Optional[aioredis.Redis] = None
 _engine_sem = asyncio.Semaphore(1)          # 引擎是单 worker（GPU 独占），这里排队
 _book_locks: Dict[str, asyncio.Lock] = {}   # 同一本书的页串行，保证上下文顺序
-_whole_book_queue: asyncio.Queue = asyncio.Queue()   # 全书翻译任务 FIFO 队列：一次只跑一本，其余排队
+_whole_book_queue: asyncio.Queue = asyncio.Queue()   # 所有用户共享全书 FIFO：单 GPU 一次只跑一本
 
 
 async def _whole_book_worker() -> None:
-    """全书翻译串行执行器：引擎只有一块 GPU，多本书按提交顺序一本本翻，其余保持 queued。"""
+    """全书翻译全局串行执行器：所有用户共用单 GPU，一本运行，其余保持 queued。"""
     while True:
         job_id, fn = await _whole_book_queue.get()
         try:
@@ -924,7 +924,9 @@ async def list_books(owner: str = Depends(get_owner)):
                   "(SELECT COUNT(*) FROM pages p WHERE p.book_id=b.id) AS translated_pages, "
                   "(SELECT COUNT(*) FROM pages p WHERE p.book_id=b.id AND p.status='done') AS done_pages, "
                   "(SELECT COUNT(*) FROM pages p WHERE p.book_id=b.id AND p.status='failed') AS failed_pages, "
-                  "(SELECT COUNT(*) FROM jobs j WHERE j.book_id=b.id AND j.status IN ('queued','running')) AS active_jobs "
+                  "(SELECT COUNT(*) FROM jobs j WHERE j.book_id=b.id AND j.status IN ('queued','running')) AS active_jobs, "
+                  "(SELECT j.status FROM jobs j WHERE j.book_id=b.id AND j.status IN ('queued','running') "
+                  " ORDER BY CASE j.status WHEN 'running' THEN 0 ELSE 1 END, j.queued_at ASC LIMIT 1) AS job_status "
                   "FROM books b WHERE b.owner=%s ORDER BY b.updated_at DESC LIMIT 200", (owner,))}
 
 
