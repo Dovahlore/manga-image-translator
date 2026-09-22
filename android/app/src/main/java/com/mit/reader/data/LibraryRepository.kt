@@ -26,25 +26,34 @@ class LibraryRepository(private val context: Context) {
 
     private data class IndexData(val books: List<Book>, val folders: List<Folder>)
 
+    /** 导入结果：book 为最终那本书（重复时是已存在的那本）；duplicate 表示内容已存在、未新建。 */
+    data class ImportResult(val book: Book, val duplicate: Boolean)
+
     suspend fun books(): List<Book> = withContext(Dispatchers.IO) { readIndexData().books }
 
     suspend fun folders(): List<Folder> = withContext(Dispatchers.IO) { readIndexData().folders }
 
     suspend fun book(id: String): Book? = withContext(Dispatchers.IO) { readIndexData().books.find { it.id == id } }
 
+    /** 按书名查本地书（WebView 下载前查重，避免重复下载已有书）。 */
+    suspend fun bookByTitle(title: String): Book? = withContext(Dispatchers.IO) {
+        val t = title.trim()
+        if (t.isBlank()) null else readIndexData().books.firstOrNull { it.title == t }
+    }
+
     suspend fun import(uri: Uri): Book = withContext(Dispatchers.IO) {
         val name = displayNameOf(uri)
         val input = context.contentResolver.openInputStream(uri)
             ?: throw IllegalStateException("无法读取所选文件")
-        importFromStream(input, name)
+        importFromStream(input, name).book
     }
 
-    /** 从本地文件导入（书库默认文件夹 / WebView 下载后的文件用）。 */
-    suspend fun importFile(file: File): Book = withContext(Dispatchers.IO) {
+    /** 从本地文件导入（书库默认文件夹 / WebView 下载后的文件用）。返回是否命中已存在（重复）。 */
+    suspend fun importFile(file: File): ImportResult = withContext(Dispatchers.IO) {
         importFromStream(file.inputStream(), file.name)
     }
 
-    private suspend fun importFromStream(input: InputStream, name: String?): Book {
+    private suspend fun importFromStream(input: InputStream, name: String?): ImportResult {
         val id = UUID.randomUUID().toString()
         val dir = File(root, id).apply { mkdirs() }
         val src = File(dir, "book.src")
@@ -63,7 +72,7 @@ class LibraryRepository(private val context: Context) {
         // 去重：同样源文件哈希的书已存在 → 直接返回已存在的那本，删掉刚导入的副本
         d.books.firstOrNull { it.hash.isNotEmpty() && it.hash == hash }?.let { existing ->
             dir.deleteRecursively()
-            return existing
+            return ImportResult(existing, true)
         }
         // 云端识别：同 hash 的云端书直接挂 cloudId（丢进 BOOKS 的、和云端同 hash 的书 → 识别成云端书）
         val cloudId = runCatching { api.cloudLookup(hash) }.getOrNull()
@@ -80,17 +89,28 @@ class LibraryRepository(private val context: Context) {
             createdAt = System.currentTimeMillis(),
         )
         writeIndex(d.books + book, d.folders)
-        return book
+        return ImportResult(book, false)
     }
 
     /** 默认书库文件夹（App 自己的外部存储 books 目录，安装即存在、无需授权）。 */
     fun defaultBooksDir(): File = File(context.getExternalFilesDir(null), "books").apply { mkdirs() }
 
-    /** 下载一个文件到默认书库文件夹（WebView 下载用），返回落盘文件。 */
-    suspend fun downloadToBooks(url: String, filename: String): File = withContext(Dispatchers.IO) {
+    /** 下载一个文件到默认书库文件夹（WebView 下载用，带 Cookie/Referer/UA 以便通过站点校验），返回落盘文件。 */
+    suspend fun downloadToBooks(
+        url: String,
+        filename: String,
+        cookie: String?,
+        referer: String?,
+        userAgent: String?,
+        onProgress: ((Long, Long) -> Unit)? = null,
+    ): File = withContext(Dispatchers.IO) {
         val safeName = filename.substringAfterLast('/').ifBlank { "download_${System.currentTimeMillis()}" }
         val f = File(defaultBooksDir(), safeName)
-        api.download(url, f)
+        val headers = mutableMapOf<String, String>()
+        cookie?.takeIf { it.isNotBlank() }?.let { headers["Cookie"] = it }
+        referer?.takeIf { it.isNotBlank() }?.let { headers["Referer"] = it }
+        userAgent?.takeIf { it.isNotBlank() }?.let { headers["User-Agent"] = it }
+        api.download(url, f, onProgress = onProgress, extraHeaders = headers)
         f
     }
 
@@ -153,13 +173,10 @@ class LibraryRepository(private val context: Context) {
             ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
     }.getOrNull()
 
-    /** 文件名 → 书名：去扩展名、去掉开头的 [来源] 标签，其余方括号换成空格。 */
-    private fun titleFromFileName(name: String?): String {
+    /** 文件名 → 书名：只去掉扩展名，其余（含 [epub]/[Kmoe] 这类方括号）原样保留，不做任何消除。 */
+    fun titleFromFileName(name: String?): String {
         if (name.isNullOrBlank()) return ""
-        var s = name.substringBeforeLast('.')
-        s = s.replace(Regex("""^\[[^\]]*]\s*"""), "")   // 去掉 [Kmoe] 这类开头的来源标签
-        s = s.replace('[', ' ').replace(']', ' ')
-        return s.replace(Regex("""\s+"""), " ").trim()
+        return name.substringBeforeLast('.').trim()
     }
 
     /** 按文件头嗅探格式：MOBI 的 PDB 头 60..68 字节是 "BOOK"+"MOBI"，EPUB 是 "PK\x03\x04"。 */

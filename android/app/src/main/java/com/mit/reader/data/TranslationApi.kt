@@ -1,5 +1,6 @@
 package com.mit.reader.data
 
+import kotlinx.coroutines.CancellationException
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
@@ -11,6 +12,8 @@ import okio.BufferedSink
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.util.concurrent.TimeUnit
 
 data class TranslateResp(val pageId: Int, val jobId: String?, val cached: Boolean)
@@ -399,9 +402,15 @@ class TranslationApi {
     fun translatedUrl(pageId: Int) = "$base/v1/pages/$pageId/image"
     fun originalUrl(pageId: Int) = "$base/v1/pages/$pageId/image?orig=1"
 
-    suspend fun download(url: String, out: File, onProgress: ((Long, Long) -> Unit)? = null) =
-        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            val req = Request.Builder().url(url).authed().build()
+    suspend fun download(
+        url: String,
+        out: File,
+        onProgress: ((Long, Long) -> Unit)? = null,
+        extraHeaders: Map<String, String> = emptyMap(),
+    ) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val builder = Request.Builder().url(url)
+            extraHeaders.forEach { (k, v) -> builder.header(k, v) }
+            val req = builder.build()
             client.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code}")
                 val body = resp.body ?: throw IllegalStateException("空响应")
@@ -421,4 +430,52 @@ class TranslationApi {
                 }
             }
         }
+
+    /** 断点续传下载：out 为 .part 文件；resumeFrom=已安全落盘的字节数。
+     *  服务端支持 Range 就 206 续传（先把 out 截到 resumeFrom 再追加），否则 200 从头覆盖；416 视为已下完。
+     *  shouldStop 返回 true 时抛 CancellationException（暂停/取消）。返回最终写入字节数。 */
+    suspend fun downloadResumable(
+        url: String,
+        out: File,
+        resumeFrom: Long,
+        extraHeaders: Map<String, String> = emptyMap(),
+        onProgress: ((Long, Long) -> Unit)? = null,
+        shouldStop: () -> Boolean = { false },
+    ): Long = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        val builder = Request.Builder().url(url)
+        extraHeaders.forEach { (k, v) -> if (v.isNotBlank()) builder.header(k, v) }
+        if (resumeFrom > 0) builder.header("Range", "bytes=$resumeFrom-")
+        val req = builder.build()
+        client.newCall(req).execute().use { resp ->
+            if (resp.code == 416) {
+                // 范围不满足：已下完
+                onProgress?.invoke(resumeFrom, resumeFrom)
+                return@withContext resumeFrom
+            }
+            val body = resp.body ?: throw IllegalStateException("空响应")
+            val append = resp.code == 206 && resumeFrom > 0
+            val remaining = body.contentLength()
+            val total = if (append) { if (remaining >= 0) resumeFrom + remaining else -1L } else remaining
+            var written = if (append) resumeFrom else 0L
+            if (append) {
+                // 把可能多写的尾块截掉，保证从 resumeFrom 精确续传
+                RandomAccessFile(out, "rw").use { it.setLength(resumeFrom) }
+            }
+            onProgress?.invoke(written, total)
+            body.byteStream().use { ins ->
+                FileOutputStream(out, append).use { os ->
+                    val buf = ByteArray(64 * 1024)
+                    while (true) {
+                        if (shouldStop()) throw CancellationException("暂停/取消")
+                        val n = ins.read(buf)
+                        if (n <= 0) break
+                        os.write(buf, 0, n)
+                        written += n
+                        onProgress?.invoke(written, total)
+                    }
+                }
+            }
+            written
+        }
+    }
 }

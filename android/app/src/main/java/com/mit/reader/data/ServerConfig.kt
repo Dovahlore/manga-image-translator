@@ -47,4 +47,11 @@ object ServerConfig {
         set(value) {
             prefs?.edit()?.putString(KEY_LIB_FOLDER_NAME, value)?.apply()
         }
+
+    /** Kmoe WebView 上次停留的网址（退出重进恢复页面用）。 */
+    var kmoeLastUrl: String?
+        get() = prefs?.getString("kmoe_last_url", null)
+        set(value) {
+            prefs?.edit()?.putString("kmoe_last_url", value)?.apply()
+        }
 }

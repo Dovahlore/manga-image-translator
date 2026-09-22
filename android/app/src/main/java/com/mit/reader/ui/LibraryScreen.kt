@@ -7,6 +7,7 @@ import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.clickable
@@ -80,9 +81,12 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import com.mit.reader.DownloadStatus
+import com.mit.reader.DownloadTask
 import com.mit.reader.ReaderApp
 import com.mit.reader.data.Book
 import com.mit.reader.data.CloudBook
@@ -94,6 +98,30 @@ import com.mit.reader.data.serverId
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
+import java.util.Locale
+
+/** 顶栏动作槽宽度：等距间距由它决定（越小越紧凑）。想调间距改这一个值即可。 */
+private val TOP_ACTION_WIDTH = 40.dp
+
+/** 顶栏动作槽：固定宽度 + 内容居中 + 点击水波纹（比 IconButton 默认 48dp 紧凑，便于等距）。 */
+@Composable
+private fun TopBarAction(
+    onClick: (() -> Unit)? = null,
+    content: @Composable () -> Unit,
+) {
+    val base = Modifier.size(width = TOP_ACTION_WIDTH, height = 48.dp)
+    Box(
+        modifier = if (onClick != null) base.clip(CircleShape).clickable(onClick = onClick) else base,
+        contentAlignment = Alignment.Center,
+    ) { content() }
+}
+
+private fun formatBytes(n: Long): String = when {
+    n >= 1L shl 30 -> String.format(Locale.US, "%.2f GB", n / (1L shl 30).toDouble())
+    n >= 1L shl 20 -> String.format(Locale.US, "%.2f MB", n / (1L shl 20).toDouble())
+    n >= 1L shl 10 -> String.format(Locale.US, "%.1f KB", n / (1L shl 10).toDouble())
+    else -> "$n B"
+}
 
 /** 书库网格里的一项：要么是本地书（带同步状态），要么是「仅云端」的云端书。 */
 private sealed class LibraryEntry {
@@ -193,6 +221,9 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit, onKmoe: () -
         folders = app.library.folders()
         lastRead = app.library.lastRead(b)
     }
+
+    // 后台导入新书（下载完成 / 扫描文件夹）后自动刷新书库，不用等 60 秒定时刷新
+    LaunchedEffect(app.libraryRevision) { reload() }
 
     // 云端列表：进入/刷新/切 tab 时拉一次（书库筛选同步状态时要用）
     LaunchedEffect(refreshing, tab) {
@@ -308,37 +339,42 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit, onKmoe: () -
         topBar = {
             TopAppBar(
                 title = {
-                    when {
-                        searchActive -> OutlinedTextField(
+                    if (searchActive) {
+                        OutlinedTextField(
                             value = searchQuery,
                             onValueChange = { searchQuery = it },
                             placeholder = { Text("搜索书名 / 收藏夹") },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                         )
-                        tab == 1 -> Text("进度")
-                        currentFolderId != null -> {
-                            val folder = folders.find { it.id == currentFolderId }
-                            if (folder != null) {
-                                val localInFolder = books.filter { it.folderId == currentFolderId }
-                                // 云端书只算「仅云端」的，避免同步+本地同一本被数两次
-                                val cloudOnlyInFolder = cloudBooks.filter { cb ->
-                                    books.none { it.cloudId == cb.id } && cb.folder == folder.name
-                                }
-                                val knownCloudIds = cloudBooks.map { it.id }.toSet()
-                                val n = when (libraryFilter) {
-                                    LibraryFilter.ALL -> localInFolder.size + cloudOnlyInFolder.size
-                                    LibraryFilter.LOCAL -> localInFolder.size
-                                    LibraryFilter.CLOUD ->
-                                        localInFolder.count { it.cloudId != null && it.cloudId in knownCloudIds } +
-                                            cloudOnlyInFolder.size
-                                }
-                                Text("${folder.name}（$n）")
-                            } else {
-                                Text("书库")
+                    } else {
+                        val titleText = when {
+                            tab == 1 -> "进度"
+                            currentFolderId != null -> {
+                                val folder = folders.find { it.id == currentFolderId }
+                                if (folder != null) {
+                                    val localInFolder = books.filter { it.folderId == currentFolderId }
+                                    // 云端书只算「仅云端」的，避免同步+本地同一本被数两次
+                                    val cloudOnlyInFolder = cloudBooks.filter { cb ->
+                                        books.none { it.cloudId == cb.id } && cb.folder == folder.name
+                                    }
+                                    val knownCloudIds = cloudBooks.map { it.id }.toSet()
+                                    val n = when (libraryFilter) {
+                                        LibraryFilter.ALL -> localInFolder.size + cloudOnlyInFolder.size
+                                        LibraryFilter.LOCAL -> localInFolder.size
+                                        LibraryFilter.CLOUD ->
+                                            localInFolder.count { it.cloudId != null && it.cloudId in knownCloudIds } +
+                                                cloudOnlyInFolder.size
+                                    }
+                                    "${folder.name}（$n）"
+                                } else "书库"
                             }
+                            else -> "书库"
                         }
-                        else -> Text("书库")
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(titleText, maxLines = 1)
+                            TextButton(onClick = onKmoe) { Text("Kmoe") }
+                        }
                     }
                 },
                 navigationIcon = {
@@ -356,23 +392,21 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit, onKmoe: () -
                     if (searchActive) {
                         IconButton(onClick = { searchQuery = "" }) { Icon(Icons.Default.Close, contentDescription = "清空") }
                     } else {
-                        // 同步转圈放最左（否则同步时顶栏右对齐，绿点会被挤得跳一下）
-                        if (app.syncingTranslations) {
-                            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        // 固定 5 个槽位（宽度 TOP_ACTION_WIDTH，比 IconButton 的 48dp 紧凑）：
+                        // 同步（最左）→ 搜索 → 排序 → 服务器状态 → 设置。
+                        // 每格内容盒固定 24dp（与图标同宽），所以等距；想调紧/调松改 TOP_ACTION_WIDTH 一个值即可。
+                        TopBarAction {
+                            if (app.syncingTranslations) {
+                                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                            }
                         }
-                        // 服务器连接状态：绿点=在线，红点=离线
-                        Box(
-                            Modifier
-                                .size(10.dp)
-                                .clip(CircleShape)
-                                .background(if (app.serverOnline) Color(0xFF43A047) else Color(0xFFD32F2F)),
-                        )
+                        // 搜索 + 排序：仅书库页；进度页不显示（绿点/设置在右边，位置不受影响）
                         if (tab == 0) {
-                            IconButton(onClick = { searchActive = true }) {
+                            TopBarAction(onClick = { searchActive = true }) {
                                 Icon(Icons.Default.Search, contentDescription = "搜索")
                             }
                             Box {
-                                IconButton(onClick = { viewMenuOpen = true }) {
+                                TopBarAction(onClick = { viewMenuOpen = true }) {
                                     Icon(Icons.Default.MoreVert, contentDescription = "视图与排序")
                                 }
                                 DropdownMenu(expanded = viewMenuOpen, onDismissRequest = { viewMenuOpen = false }) {
@@ -397,8 +431,21 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit, onKmoe: () -
                                 }
                             }
                         }
-                        TextButton(onClick = onKmoe) { Text("Kmoe") }
-                        IconButton(onClick = onSettings) { Icon(Icons.Default.Settings, contentDescription = "设置") }
+                        // 绿点=在线，红点=离线；点一下立即重新检测
+                        TopBarAction(onClick = { app.refreshServerStatus() }) {
+                            // 内容盒 24dp（与图标同宽）：绿点居中，左右视觉间距和相邻图标一致
+                            Box(Modifier.size(24.dp), contentAlignment = Alignment.Center) {
+                                Box(
+                                    Modifier
+                                        .size(10.dp)
+                                        .clip(CircleShape)
+                                        .background(if (app.serverOnline) Color(0xFF43A047) else Color(0xFFD32F2F)),
+                                )
+                            }
+                        }
+                        TopBarAction(onClick = onSettings) {
+                            Icon(Icons.Default.Settings, contentDescription = "设置")
+                        }
                     }
                 },
             )
@@ -1812,19 +1859,13 @@ private fun ProgressList(
 ) {
     var localExpanded by remember { mutableStateOf(true) }
     var cloudExpanded by remember { mutableStateOf(true) }
+    var downloadsExpanded by remember { mutableStateOf(true) }
+    val app = LocalContext.current.applicationContext as ReaderApp
+    val downloadTasks = app.downloadTasks
+    val hasFinishedDownload = downloadTasks.any {
+        it.status == DownloadStatus.DONE || it.status == DownloadStatus.DUPLICATE
+    }
 
-    if (error != null) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text("加载进度失败：$error", color = MaterialTheme.colorScheme.error)
-        }
-        return
-    }
-    if (books.isEmpty() && cloudBooks.isEmpty()) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text("暂无书籍", color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        return
-    }
     // 已同步书的服务端 book_id 是 cloudId（serverId），未同步是本地 id
     val serverMap = serverBooks.associateBy { it.id }
     val visibleBooks = books.filter { book ->
@@ -1838,9 +1879,17 @@ private fun ProgressList(
         books.none { it.cloudId == cb.id } &&
             serverMap[cb.id]?.let { it.donePages + it.failedPages > 0 || it.activeJobs > 0 } == true
     }
-    if (visibleBooks.isEmpty() && visibleCloud.isEmpty()) {
+    if (downloadTasks.isEmpty() && visibleBooks.isEmpty() && visibleCloud.isEmpty()) {
+        val emptyText = when {
+            error != null -> "加载进度失败：$error"
+            books.isEmpty() && cloudBooks.isEmpty() -> "暂无书籍"
+            else -> "还没有翻译过的书"
+        }
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text("还没有翻译过的书", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                emptyText,
+                color = if (error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
         return
     }
@@ -1849,6 +1898,27 @@ private fun ProgressList(
         contentPadding = PaddingValues(12.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        if (downloadTasks.isNotEmpty()) {
+            item(key = "download-header") {
+                DownloadSectionHeader(
+                    count = downloadTasks.size,
+                    expanded = downloadsExpanded,
+                    hasFinished = hasFinishedDownload,
+                    onToggle = { downloadsExpanded = !downloadsExpanded },
+                    onClear = { app.clearFinishedDownloads() },
+                )
+            }
+            if (downloadsExpanded) {
+                listItems(downloadTasks, key = { it.id }) { task ->
+                    DownloadRow(
+                        task = task,
+                        onPause = { app.pauseDownload(task.id) },
+                        onResume = { app.resumeDownload(task.id) },
+                        onCancel = { app.cancelDownload(task.id) },
+                    )
+                }
+            }
+        }
         if (visibleBooks.isNotEmpty()) {
             item(key = "local-header") {
                 ProgressSectionHeader(
@@ -1928,6 +1998,144 @@ private fun ProgressList(
                     )
                 }
             }
+        }
+    }
+}
+
+/** 进度页「下载」区分组头：计数 + 清除已结束记录。 */
+@Composable
+private fun DownloadSectionHeader(
+    count: Int,
+    expanded: Boolean,
+    hasFinished: Boolean,
+    onToggle: () -> Unit,
+    onClear: () -> Unit,
+) {
+    Surface(
+        onClick = onToggle,
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("下载 · $count", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+            if (hasFinished) {
+                TextButton(onClick = onClear) { Text("清除已完成") }
+            }
+            Text(
+                if (expanded) "收起 ▲" else "展开 ▼",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.primary,
+            )
+        }
+    }
+}
+
+/** 进度页「下载」区的一行：文件名 + 状态 + 进度条 + 暂停/继续/取消。 */
+@Composable
+private fun DownloadRow(
+    task: DownloadTask,
+    onPause: () -> Unit,
+    onResume: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    val statusText = when (task.status) {
+        DownloadStatus.DOWNLOADING -> "下载中"
+        DownloadStatus.PAUSED -> "已暂停"
+        DownloadStatus.IMPORTING -> "导入中"
+        DownloadStatus.DONE -> "已完成"
+        DownloadStatus.DUPLICATE -> "已存在"
+        DownloadStatus.FAILED -> "失败"
+        DownloadStatus.CANCELED -> "已取消"
+    }
+    val statusColor = when (task.status) {
+        DownloadStatus.FAILED -> MaterialTheme.colorScheme.error
+        DownloadStatus.PAUSED -> Color(0xFFF57C00)
+        DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING -> MaterialTheme.colorScheme.primary
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    val showProgress = task.status == DownloadStatus.DOWNLOADING ||
+        task.status == DownloadStatus.IMPORTING ||
+        task.status == DownloadStatus.PAUSED
+
+    Surface(
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
+            Row(verticalAlignment = Alignment.Top) {
+                Text(
+                    task.title.ifBlank { task.name },
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(statusText, style = MaterialTheme.typography.labelMedium, color = statusColor)
+            }
+            if (task.message.isNotBlank()) {
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    task.message,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (showProgress) {
+                Spacer(Modifier.height(8.dp))
+                if (task.total > 0) {
+                    LinearProgressIndicator(
+                        progress = { (task.written.toFloat() / task.total).coerceIn(0f, 1f) },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "${(task.written * 100 / task.total).coerceAtMost(100)}%",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(Modifier.weight(1f))
+                        Text(
+                            "${formatBytes(task.written)} / ${formatBytes(task.total)}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                } else {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "已接收 ${formatBytes(task.written)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            val actions: (@Composable () -> Unit)? = when (task.status) {
+                DownloadStatus.DOWNLOADING, DownloadStatus.IMPORTING -> {
+                    { Row {
+                        TextButton(onClick = onPause, contentPadding = PaddingValues(horizontal = 10.dp)) { Text("暂停") }
+                        TextButton(onClick = onCancel, contentPadding = PaddingValues(horizontal = 10.dp)) { Text("取消") }
+                    } }
+                }
+                DownloadStatus.PAUSED, DownloadStatus.FAILED -> {
+                    { Row {
+                        TextButton(onClick = onResume, contentPadding = PaddingValues(horizontal = 10.dp)) {
+                            Text(if (task.status == DownloadStatus.FAILED) "重试" else "继续")
+                        }
+                        TextButton(onClick = onCancel, contentPadding = PaddingValues(horizontal = 10.dp)) { Text("删除") }
+                    } }
+                }
+                else -> null
+            }
+            actions?.invoke()
         }
     }
 }

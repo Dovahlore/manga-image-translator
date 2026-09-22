@@ -1,6 +1,7 @@
 package com.mit.reader
 
 import android.app.Application
+import android.net.Uri
 import android.widget.Toast
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
@@ -24,6 +25,29 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
 import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+
+/** WebView 后台下载任务状态。 */
+enum class DownloadStatus { DOWNLOADING, PAUSED, IMPORTING, DONE, DUPLICATE, FAILED, CANCELED }
+
+/** 一条后台下载任务（进度页「下载」区展示）。 */
+data class DownloadTask(
+    val id: String,
+    val url: String,
+    val name: String,
+    val title: String,
+    val cookie: String? = null,
+    val referer: String? = null,
+    val userAgent: String? = null,
+    val written: Long = 0L,
+    val total: Long = 0L,
+    val status: DownloadStatus = DownloadStatus.DOWNLOADING,
+    val message: String = "",
+)
 
 class ReaderApp : Application() {
     lateinit var library: LibraryRepository
@@ -54,15 +78,210 @@ class ReaderApp : Application() {
     /** 服务器是否可达（书库/进度页顶栏显示绿点=在线 / 红点=离线）。 */
     var serverOnline by mutableStateOf(true)
         private set
+    /** 书库内容版本号：后台导入（下载完成 / 扫描文件夹）新增书后自增，书库页据此自动刷新。 */
+    var libraryRevision by mutableStateOf(0)
+        private set
+
+    /** 通知书库内容变了（后台新增/删除书后调用）。 */
+    fun bumpLibrary() { libraryRevision++ }
+
+    /** 外部程序「打开」epub/mobi 后待跳转的书 id；AppNav 消费后进阅读器。 */
+    var pendingOpenBookId by mutableStateOf<String?>(null)
+        private set
+
+    fun consumePendingOpen() { pendingOpenBookId = null }
+
+    /** 外部「打开方式」进来：导入（按内容 hash 去重）并请求打开阅读器。 */
+    fun openDocument(uri: Uri) {
+        appScope.launch {
+            Toast.makeText(this@ReaderApp, "正在导入…", Toast.LENGTH_SHORT).show()
+            val book = runCatching { library.import(uri) }.getOrElse { e ->
+                Toast.makeText(this@ReaderApp, "导入失败：${e.message}", Toast.LENGTH_LONG).show()
+                return@launch
+            }
+            bumpLibrary()
+            pendingOpenBookId = book.id
+        }
+    }
 
     /** 每下好一页译文图就发一次事件 (bookId, pageIndex)：阅读器按书订阅，免轮询。 */
     private val _pageTranslated = MutableSharedFlow<Pair<String, Int>>(extraBufferCapacity = 64)
     val pageTranslated: SharedFlow<Pair<String, Int>> = _pageTranslated.asSharedFlow()
 
+    // ---- WebView 后台下载队列（进度页「下载」区查看全部进度，支持暂停/继续/取消/断点续传）----
+
+    /** 全部后台下载任务（含进行中/暂停/失败），Compose 可直接观察。 */
+    val downloadTasks = mutableStateListOf<DownloadTask>()
+    private val downloadStops = ConcurrentHashMap<String, AtomicBoolean>()
+    private val downloadPersistAt = ConcurrentHashMap<String, Long>()
+    private val downloadsPrefKey = "downloads"
+
+    /** 加入后台下载：创建任务后立即开始。 */
+    fun enqueueDownload(url: String, name: String, cookie: String?, referer: String?, userAgent: String?) {
+        val title = library.titleFromFileName(name)
+        val task = DownloadTask(UUID.randomUUID().toString(), url, name, title, cookie, referer, userAgent)
+        downloadTasks.add(0, task)   // 新的在最上面
+        downloadStops[task.id] = AtomicBoolean(false)
+        persistDownloads()
+        runDownload(task.id)
+    }
+
+    fun pauseDownload(id: String) {
+        downloadStops.getOrPut(id) { AtomicBoolean(false) }.set(true)
+        // 状态等 worker 抛 CancellationException 后置为 PAUSED
+    }
+
+    fun resumeDownload(id: String) {
+        downloadStops.remove(id)
+        updateDownload(id) { it.copy(status = DownloadStatus.DOWNLOADING, message = "") }
+        persistDownloads()
+        runDownload(id)
+    }
+
+    fun cancelDownload(id: String) {
+        downloadStops.getOrPut(id) { AtomicBoolean(false) }.set(true)
+        downloadTasks.removeAll { it.id == id }
+        partFile(id).delete()
+        persistDownloads()
+    }
+
+    /** 清除已结束（完成/重复）的下载记录。 */
+    fun clearFinishedDownloads() {
+        downloadTasks.removeAll { it.status == DownloadStatus.DONE || it.status == DownloadStatus.DUPLICATE || it.status == DownloadStatus.CANCELED }
+    }
+
+    private fun partFile(id: String): File =
+        File(File(getExternalFilesDir(null), "downloads").apply { mkdirs() }, "$id.part")
+
+    private fun runDownload(taskId: String) {
+        appScope.launch {
+            try {
+                val idx = downloadTasks.indexOfFirst { it.id == taskId }
+                if (idx < 0) return@launch
+                val task = downloadTasks[idx]
+                val part = partFile(taskId)
+
+                val finalWritten = api.downloadResumable(
+                    url = task.url,
+                    out = part,
+                    resumeFrom = task.written.coerceAtLeast(0),
+                    extraHeaders = mapOf(
+                        "Cookie" to (task.cookie ?: ""),
+                        "Referer" to (task.referer ?: ""),
+                        "User-Agent" to (task.userAgent ?: ""),
+                    ),
+                    shouldStop = { downloadStops[taskId]?.get() == true },
+                    onProgress = { w, t ->
+                        // 进度回调在 IO 线程：所有 Compose 状态写回必须切回主线程，否则快照竞态会闪退
+                        val now = System.currentTimeMillis()
+                        if (now - (downloadPersistAt[taskId] ?: 0L) > 200) {
+                            downloadPersistAt[taskId] = now
+                            appScope.launch {
+                                updateDownload(taskId) { it.copy(written = w, total = t) }
+                                persistDownloads()
+                            }
+                        }
+                    },
+                )
+
+                // 下载完成：落盘到最终文件名 → 导入 → 删暂存（本协程在主线程，直接更新状态）
+                updateDownload(taskId) { it.copy(written = finalWritten, status = DownloadStatus.IMPORTING) }
+                persistDownloads()
+                val finalFile = File(library.defaultBooksDir(), task.name)
+                if (finalFile.exists()) finalFile.delete()
+                if (!part.renameTo(finalFile)) { part.copyTo(finalFile, overwrite = true); part.delete() }
+                val result = library.importFile(finalFile)
+                finalFile.delete()
+                val (st, msg) = if (result.duplicate) DownloadStatus.DUPLICATE to "本地已有《${result.book.title}》"
+                                else DownloadStatus.DONE to "已导入《${result.book.title}》"
+                updateDownload(taskId) { it.copy(status = st, message = msg) }
+                persistDownloads()
+                if (!result.duplicate) {
+                    bumpLibrary()   // 新书入库：书库页立即刷新（不依赖扫描/定时刷新）
+                    Toast.makeText(this@ReaderApp, "已导入《${result.book.title}》", Toast.LENGTH_SHORT).show()
+                }
+                // 成功/重复保留 10 秒让进度页看到，再自动清掉
+                delay(10_000)
+                downloadTasks.removeAll { it.id == taskId }
+                persistDownloads()
+            } catch (e: CancellationException) {
+                // 暂停（任务还在）或取消（任务已删）
+                if (downloadTasks.any { it.id == taskId }) {
+                    // 用 .part 实际字节数作断点（已 flush 的干净边界），续传不再重下尾巴
+                    updateDownload(taskId) {
+                        it.copy(status = DownloadStatus.PAUSED, written = partFile(taskId).length(), message = "已暂停")
+                    }
+                    persistDownloads()
+                }
+            } catch (e: Exception) {
+                if (downloadTasks.any { it.id == taskId }) {
+                    updateDownload(taskId) { it.copy(status = DownloadStatus.FAILED, message = e.message ?: "下载失败") }
+                    persistDownloads()
+                }
+            } finally {
+                downloadStops.remove(taskId)
+                downloadPersistAt.remove(taskId)
+            }
+        }
+    }
+
+    private fun updateDownload(id: String, transform: (DownloadTask) -> DownloadTask) {
+        val idx = downloadTasks.indexOfFirst { it.id == id }
+        if (idx >= 0) downloadTasks[idx] = transform(downloadTasks[idx])
+    }
+
+    private fun persistDownloads() {
+        val arr = JSONArray()
+        for (t in downloadTasks) {
+            if (t.status == DownloadStatus.DOWNLOADING || t.status == DownloadStatus.PAUSED || t.status == DownloadStatus.FAILED) {
+                arr.put(JSONObject().apply {
+                    put("id", t.id)
+                    put("url", t.url)
+                    put("name", t.name)
+                    put("title", t.title)
+                    t.cookie?.let { put("cookie", it) }
+                    t.referer?.let { put("referer", it) }
+                    t.userAgent?.let { put("user_agent", it) }
+                    put("total", t.total)
+                    put("written", t.written)
+                    put("status", t.status.name)
+                    put("message", t.message)
+                })
+            }
+        }
+        prefs.edit().putString(downloadsPrefKey, arr.toString()).apply()
+    }
+
+    /** 进程重启后恢复未完成的下载（进行中→暂停，保留 .part 断点）。 */
+    private fun loadDownloads() {
+        val raw = prefs.getString(downloadsPrefKey, null) ?: return
+        val arr = runCatching { JSONArray(raw) }.getOrNull() ?: return
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val id = o.optString("id")
+            if (id.isBlank()) continue
+            val status = runCatching { DownloadStatus.valueOf(o.optString("status")) }.getOrNull() ?: DownloadStatus.FAILED
+            downloadTasks.add(DownloadTask(
+                id = id,
+                url = o.optString("url"),
+                name = o.optString("name"),
+                title = o.optString("title"),
+                cookie = o.optString("cookie").takeIf { it.isNotBlank() },
+                referer = o.optString("referer").takeIf { it.isNotBlank() },
+                userAgent = o.optString("user_agent").takeIf { it.isNotBlank() },
+                written = o.optLong("written", 0),
+                total = o.optLong("total", 0),
+                status = if (status == DownloadStatus.DOWNLOADING) DownloadStatus.PAUSED else status,
+                message = if (status == DownloadStatus.DOWNLOADING) "上次未完成，可继续下载" else o.optString("message"),
+            ))
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         ServerConfig.init(this)
         library = LibraryRepository(this)
+        loadDownloads()
         resumeTranslatingBook()
         startBackgroundSync()
         startConnectivityMonitor()
@@ -78,13 +297,26 @@ class ReaderApp : Application() {
         }
     }
 
+    /** 立即 ping 并更新绿点，返回结果文案（设置页「测试连接」用）。 */
+    suspend fun pingAndUpdate(): String {
+        val r = api.ping()
+        serverOnline = r.startsWith("OK")
+        return r
+    }
+
+    /** 异步刷新在线状态（保存配置后让绿点即时反映新地址连通性）。 */
+    fun refreshServerStatus() {
+        appScope.launch { serverOnline = api.ping().startsWith("OK") }
+    }
+
     /** 打开 App + 定时后台同步：给所有书补拉缺失/变化的译文页（同步书别的设备新翻的、非同步书服务端已翻好的）。
      *  只补差异，不全量，避免卡顿。 */
     private fun startBackgroundSync() {
         appScope.launch {
             delay(1500)
             // 打开时：先扫书库文件夹（识别云端书），再同步（把识别成云端书后缺的远程译文拉下来）
-            runCatching { library.scanLibraryFolder() }
+            val scanned = runCatching { library.scanLibraryFolder() }.getOrDefault(0)
+            if (scanned > 0) bumpLibrary()   // 扫到新书：书库页刷新
             runCatching { drainPendingDeletes() }
             runCatching { drainPendingCancels() }
             runCatching { syncAllBooks() }

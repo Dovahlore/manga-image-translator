@@ -124,6 +124,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                         ServerConfig.baseUrl = url
                         ServerConfig.apiKey = key
                         result = "已保存"
+                        app.refreshServerStatus()   // 保存后绿点即时反映新地址连通性
                     },
                     modifier = Modifier.weight(1f),
                 ) { Text("保存") }
@@ -132,7 +133,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                         ServerConfig.baseUrl = url
                         ServerConfig.apiKey = key
                         result = "测试中…"
-                        scope.launch { result = app.api.ping() }
+                        scope.launch { result = app.pingAndUpdate() }
                     },
                     modifier = Modifier.weight(1f).padding(start = 8.dp),
                 ) { Text("测试连接") }
