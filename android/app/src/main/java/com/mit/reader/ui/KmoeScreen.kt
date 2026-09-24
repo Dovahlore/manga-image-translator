@@ -2,6 +2,7 @@ package com.mit.reader.ui
 
 import android.annotation.SuppressLint
 import android.webkit.CookieManager
+import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -130,6 +131,9 @@ fun KmoeScreen(onBack: () -> Unit) {
 
                     val webView = this
                     webViewClient = object : WebViewClient() {
+                        override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean =
+                            false   // 所有链接（含 target=_blank）都在本 WebView 内打开，保证返回历史正确
+
                         override fun onPageFinished(view: WebView?, url: String?) {
                             super.onPageFinished(view, url)
                             // 记下当前页，退出重进恢复
