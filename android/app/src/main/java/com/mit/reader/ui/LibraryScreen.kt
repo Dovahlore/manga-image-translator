@@ -169,7 +169,7 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit, onKmoe: () -
     var cloudErr by remember { mutableStateOf<String?>(null) }
     var serverBooks by remember { mutableStateOf<List<ServerBook>>(emptyList()) }
     var progressErr by remember { mutableStateOf<String?>(null) }
-    var syncing by remember { mutableStateOf<SyncTask?>(null) }
+    var syncTasks by remember { mutableStateOf<Map<String, SyncTask>>(emptyMap()) }
     var cloudSubmittingIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     var gridMode by remember { mutableStateOf(true) }
     var sortMode by remember { mutableStateOf(SortMode.NAME) }
@@ -190,6 +190,12 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit, onKmoe: () -
     val scope = rememberCoroutineScope()
 
     fun reload() { refreshing++ }
+
+    /** 每本书独立一条同步/下载进度（主线程写，多个可同时存在）。 */
+    fun setSync(id: String, text: String, frac: Float?) {
+        syncTasks = syncTasks + (id to SyncTask(id, text, frac))
+    }
+    fun clearSync(id: String) { syncTasks = syncTasks - id }
 
     /** 按当前排序方式排本地书。 */
     fun sortedBooks(list: List<Book>): List<Book> = when (sortMode) {
@@ -253,11 +259,16 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit, onKmoe: () -
     fun doSync(book: Book) {
         scope.launch {
             app.stopTranslatingIf(book.id)   // 同步会迁移 book_id，正在翻就先停，避免轮询到旧 id
-            syncing = SyncTask(book.id, "打包中…", null)
-            runCatching { app.library.sync(book) { text, frac -> syncing = SyncTask(book.id, text, frac) } }
+            setSync(book.id, "打包中…", null)
+            runCatching {
+                app.library.sync(book) { text, frac ->
+                    // 进度回调在 IO 线程，切回主线程写 Compose 状态
+                    scope.launch { setSync(book.id, text, frac) }
+                }
+            }
                 .onSuccess { Toast.makeText(app, "已同步《${it.title}》", Toast.LENGTH_SHORT).show(); reload() }
                 .onFailure { Toast.makeText(app, "同步失败：${it.message}", Toast.LENGTH_LONG).show() }
-            syncing = null
+            clearSync(book.id)
         }
     }
 
@@ -280,11 +291,15 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit, onKmoe: () -
 
     fun doDownloadCloud(cb: CloudBook) {
         scope.launch {
-            syncing = SyncTask(cb.id, "下载中…", null)
-            runCatching { app.library.downloadCloud(cb) { text, frac -> syncing = SyncTask(cb.id, text, frac) } }
+            setSync(cb.id, "下载中…", null)
+            runCatching {
+                app.library.downloadCloud(cb) { text, frac ->
+                    scope.launch { setSync(cb.id, text, frac) }
+                }
+            }
                 .onSuccess { Toast.makeText(app, "已下载《${it.title}》", Toast.LENGTH_SHORT).show(); reload() }
                 .onFailure { Toast.makeText(app, "下载失败：${it.message}", Toast.LENGTH_LONG).show() }
-            syncing = null
+            clearSync(cb.id)
         }
     }
 
@@ -453,7 +468,7 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit, onKmoe: () -
         floatingActionButton = {
             if (tab == 0) {
                 FloatingActionButton(onClick = { importLauncher.launch("*/*") }) {
-                    Icon(Icons.Default.Add, contentDescription = "导入 EPUB / MOBI")
+                    Icon(Icons.Default.Add, contentDescription = "导入 EPUB / MOBI / 漫画压缩包")
                 }
             }
         },
@@ -468,7 +483,7 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit, onKmoe: () -
                     onOpenBook = { id -> searchActive = false; searchQuery = ""; onOpen(id) },
                     onEnterFolder = { id -> searchActive = false; searchQuery = ""; currentFolderId = id },
                     onDownloadCloud = { doDownloadCloud(it) },
-                    downloadingCloudId = syncing?.id,
+                    downloadingCloudIds = syncTasks.keys.toSet(),
                 )
             } else {
                 TabRow(selectedTabIndex = tab) {
@@ -603,7 +618,7 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit, onKmoe: () -
                         translatingBookId = app.translatingBookId,
                         translatingProgress = app.translatingProgress,
                         queuedBookIds = app.queuedBookIds.toSet(),
-                        syncing = syncing,
+                        syncTasks = syncTasks,
                         gridMode = gridMode,
                     )
                 }
@@ -793,7 +808,7 @@ private fun LibraryTab(
     translatingBookId: String?,
     translatingProgress: Pair<Int, Int>?,
     queuedBookIds: Set<String>,
-    syncing: SyncTask?,
+    syncTasks: Map<String, SyncTask>,
     gridMode: Boolean,
 ) {
     val localBooks = entries.mapNotNull { (it as? LibraryEntry.Local)?.book }
@@ -852,14 +867,14 @@ private fun LibraryTab(
                         isTranslating = translatingBookId == book.id,
                         isQueued = book.id in queuedBookIds,
                         progressText = if (translatingBookId == book.id) translatingProgress?.let { "${it.first}/${it.second}" } else null,
-                        syncing = syncing,
+                        syncTasks = syncTasks,
                     )
                 }
                 gridItems(inCloud, key = { it.id }) { cb ->
                     CloudCell(
                         cloud = cb,
                         translation = cloudTranslationStates[cb.id],
-                        syncing = syncing,
+                        syncTasks = syncTasks,
                         onDownload = { onDownloadCloud(cb) },
                         onDelete = { onDeleteCloud(cb) },
                         onTranslateAll = { onTranslateAllCloud(cb) },
@@ -890,14 +905,14 @@ private fun LibraryTab(
                         isTranslating = translatingBookId == book.id,
                         isQueued = book.id in queuedBookIds,
                         progressText = if (translatingBookId == book.id) translatingProgress?.let { "${it.first}/${it.second}" } else null,
-                        syncing = syncing,
+                        syncTasks = syncTasks,
                     )
                 }
                 listItems(inCloud, key = { it.id }) { cb ->
                     CloudRow(
                         cloud = cb,
                         translation = cloudTranslationStates[cb.id],
-                        syncing = syncing,
+                        syncTasks = syncTasks,
                         onDownload = { onDownloadCloud(cb) },
                         onDelete = { onDeleteCloud(cb) },
                         onTranslateAll = { onTranslateAllCloud(cb) },
@@ -914,7 +929,7 @@ private fun LibraryTab(
     if (localBooks.isEmpty() && folders.isEmpty() && cloudOnly.isEmpty()) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text("点右下角 + 导入 EPUB / MOBI", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("点右下角 + 导入 EPUB / MOBI / 漫画压缩包", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 TextButton(onClick = onNewFolder) { Text("新建收藏夹") }
             }
         }
@@ -975,7 +990,7 @@ private fun LibraryTab(
                         isTranslating = translatingBookId == book.id,
                         isQueued = book.id in queuedBookIds,
                         progressText = if (translatingBookId == book.id) translatingProgress?.let { "${it.first}/${it.second}" } else null,
-                        syncing = syncing,
+                        syncTasks = syncTasks,
                     )
                 }
             }
@@ -992,7 +1007,7 @@ private fun LibraryTab(
                     CloudCell(
                         cloud = cb,
                         translation = cloudTranslationStates[cb.id],
-                        syncing = syncing,
+                        syncTasks = syncTasks,
                         onDownload = { onDownloadCloud(cb) },
                         onDelete = { onDeleteCloud(cb) },
                         onTranslateAll = { onTranslateAllCloud(cb) },
@@ -1003,7 +1018,7 @@ private fun LibraryTab(
             if (unFiled.isEmpty() && localBooks.isEmpty() && cloudOnly.isEmpty() && folders.isNotEmpty()) {
                 item(span = { GridItemSpan(maxLineSpan) }) {
                     Text(
-                        "点右下角 + 导入 EPUB / MOBI",
+                        "点右下角 + 导入 EPUB / MOBI / 漫画压缩包",
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(vertical = 8.dp),
                     )
@@ -1063,7 +1078,7 @@ private fun LibraryTab(
                         isTranslating = translatingBookId == book.id,
                         isQueued = book.id in queuedBookIds,
                         progressText = if (translatingBookId == book.id) translatingProgress?.let { "${it.first}/${it.second}" } else null,
-                        syncing = syncing,
+                        syncTasks = syncTasks,
                     )
                 }
             }
@@ -1080,7 +1095,7 @@ private fun LibraryTab(
                     CloudRow(
                         cloud = cb,
                         translation = cloudTranslationStates[cb.id],
-                        syncing = syncing,
+                        syncTasks = syncTasks,
                         onDownload = { onDownloadCloud(cb) },
                         onDelete = { onDeleteCloud(cb) },
                         onTranslateAll = { onTranslateAllCloud(cb) },
@@ -1091,7 +1106,7 @@ private fun LibraryTab(
             if (unFiled.isEmpty() && localBooks.isEmpty() && cloudOnly.isEmpty() && folders.isNotEmpty()) {
                 item {
                     Text(
-                        "点右下角 + 导入 EPUB / MOBI",
+                        "点右下角 + 导入 EPUB / MOBI / 漫画压缩包",
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(vertical = 8.dp),
                     )
@@ -1263,7 +1278,7 @@ private fun BookCell(
     isTranslating: Boolean,
     isQueued: Boolean = false,
     progressText: String?,
-    syncing: SyncTask? = null,
+    syncTasks: Map<String, SyncTask> = emptyMap(),
 ) {
     Column {
         Box(Modifier.fillMaxWidth().aspectRatio(0.72f)) {
@@ -1326,9 +1341,7 @@ private fun BookCell(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         // 同步/下载进度（书卡片下方的小进度条，不弹窗，不挡操作）
-        if (syncing?.id == book.id) {
-            SyncProgressLine(syncing!!.text, syncing!!.frac)
-        }
+        syncTasks[book.id]?.let { SyncProgressLine(it.text, it.frac) }
         if (isTranslating) {
             val total = book.pageCount
             val done = progressText?.substringBefore('/')?.trim()?.toIntOrNull() ?: 0
@@ -1443,7 +1456,7 @@ private fun CloudCell(
     onDelete: () -> Unit,
     onTranslateAll: () -> Unit = {},
     onMove: () -> Unit = {},
-    syncing: SyncTask? = null,
+    syncTasks: Map<String, SyncTask> = emptyMap(),
 ) {
     val app = LocalContext.current.applicationContext as ReaderApp
     var coverReady by remember { mutableStateOf(false) }
@@ -1509,9 +1522,7 @@ private fun CloudCell(
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        if (syncing?.id == cloud.id) {
-            SyncProgressLine(syncing!!.text, syncing!!.frac)
-        }
+        syncTasks[cloud.id]?.let { SyncProgressLine(it.text, it.frac) }
         CloudTranslationProgress(translation)
     }
 }
@@ -1535,7 +1546,7 @@ private fun BookRow(
     isTranslating: Boolean,
     isQueued: Boolean = false,
     progressText: String?,
-    syncing: SyncTask? = null,
+    syncTasks: Map<String, SyncTask> = emptyMap(),
 ) {
     Row(
         Modifier.fillMaxWidth().combinedClickable(onClick = onOpen, onLongClick = onLongPress).padding(vertical = 6.dp),
@@ -1568,10 +1579,7 @@ private fun BookRow(
             } else if (isQueued) {
                 Text("排队中…", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.tertiary)
             }
-            if (syncing?.id == book.id) {
-                SyncProgressLine(syncing!!.text, syncing!!.frac)
-            }
-        }
+            syncTasks[book.id]?.let { SyncProgressLine(it.text, it.frac) }        }
         var menuOpen by remember { mutableStateOf(false) }
         Box {
             Icon(
@@ -1612,7 +1620,7 @@ private fun CloudRow(
     onDelete: () -> Unit,
     onTranslateAll: () -> Unit = {},
     onMove: () -> Unit = {},
-    syncing: SyncTask? = null,
+    syncTasks: Map<String, SyncTask> = emptyMap(),
 ) {
     val app = LocalContext.current.applicationContext as ReaderApp
     var coverReady by remember { mutableStateOf(false) }
@@ -1636,9 +1644,7 @@ private fun CloudRow(
                 CloudBadge(color = Color(0xFF43A047))
             }
             Text("${cloud.pageCount ?: 0} 页 · 云端", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (syncing?.id == cloud.id) {
-                SyncProgressLine(syncing!!.text, syncing!!.frac)
-            }
+            syncTasks[cloud.id]?.let { SyncProgressLine(it.text, it.frac) }
             CloudTranslationProgress(translation)
         }
         var menuOpen by remember { mutableStateOf(false) }
@@ -2276,7 +2282,7 @@ private fun SearchResults(
     onOpenBook: (String) -> Unit,
     onEnterFolder: (String) -> Unit,
     onDownloadCloud: (CloudBook) -> Unit,
-    downloadingCloudId: String?,
+    downloadingCloudIds: Set<String>,
 ) {
     val q = query.trim()
     if (q.isEmpty()) {
@@ -2349,7 +2355,7 @@ private fun SearchResults(
             }
             listItems(matchedCloudBooks, key = { "cloud-search-${it.id}" }) { cloud ->
                 val folderText = cloud.folder?.takeIf { it.isNotBlank() }?.let { "在「$it」" } ?: "未分类"
-                val downloading = downloadingCloudId == cloud.id
+                val downloading = cloud.id in downloadingCloudIds
                 SearchRow(
                     title = cloud.title ?: "未命名",
                     subtitle = "仅云端 · $folderText",

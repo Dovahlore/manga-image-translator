@@ -137,15 +137,14 @@ fun KmoeScreen(onBack: () -> Unit) {
                         }
                     }
 
-                    // 拦截下载：只允许 epub/mobi；先查重 + 弹确认，确认后进后台队列
+                    // 拦截下载：epub/mobi/漫画压缩包一视同仁；先查重 + 弹确认，确认后进后台队列
                     setDownloadListener { url, userAgent, contentDisposition, _, _ ->
                         val name = decodeFileName(
                             url.substringAfterLast('/').substringBefore('?')
                                 .ifBlank { "download_${System.currentTimeMillis()}" },
                         )
-                        val lower = name.lowercase()
-                        if (!lower.endsWith(".epub") && !lower.endsWith(".mobi")) {
-                            Toast.makeText(context, "只支持下载 epub / mobi", Toast.LENGTH_SHORT).show()
+                        if (!app.library.isSupportedName(name)) {
+                            Toast.makeText(context, "只支持下载 epub / mobi / 漫画压缩包(zip,rar,cbz,cbr)", Toast.LENGTH_SHORT).show()
                             return@setDownloadListener
                         }
                         val cookie = CookieManager.getInstance().getCookie(url)

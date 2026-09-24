@@ -72,4 +72,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     // SAF 文件夹访问（书库文件夹自动扫描导入）
     implementation("androidx.documentfile:documentfile:1.0.1")
+    // 漫画压缩包 CBR(RAR4/RAR5) 解压；CBZ(ZIP) 用 JDK 自带 java.util.zip
+    // 注意：junrar 不支持 RAR5（会抛 UnsupportedRarV5Exception），所以用纯 Java 的 unrar5j
+    implementation("io.github.realburst:unrar5j:v2.0.4")
 }

@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import os
 import pickle
 import io
@@ -129,6 +130,13 @@ class MangaShare:
             await self.progress_queue.put(encoded_result)
         finally:
             self.lock.release()
+            # 每页翻完释放图片/中间张量：全书翻译连翻几百页，不释放会无界累积把 VM 内存吃爆
+            gc.collect()
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
 
     def check_nonce(self, request: Request):
@@ -169,6 +177,7 @@ class MangaShare:
             # 就会把它置 True，而本路由从不清它 —— 结果之后每个非流式请求
             # （App 接口、脚本、comicread 等）都只拿到 1x1 白图占位符。
             self.manga._is_streaming_mode = False
+            result = None
             try:
                 if asyncio.iscoroutinefunction(method):
                     result = await method(**attr)
@@ -180,6 +189,15 @@ class MangaShare:
             except Exception as e:
                 self.lock.release()
                 raise HTTPException(status_code=500, detail=str(e))
+            finally:
+                # 每页翻完立刻释放图片/中间张量，避免全书翻译时内存无界累积
+                del result
+                gc.collect()
+                try:
+                    import torch
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
         @app.post("/execute/{method_name}")
         async def execute_method(request: Request, method_name: str = Path(...)):

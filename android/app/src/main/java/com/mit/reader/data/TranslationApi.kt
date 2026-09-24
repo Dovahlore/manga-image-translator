@@ -409,7 +409,9 @@ class TranslationApi {
         extraHeaders: Map<String, String> = emptyMap(),
     ) = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
             val builder = Request.Builder().url(url)
-            extraHeaders.forEach { (k, v) -> builder.header(k, v) }
+            // 自己服务器的资源（译文图 / 云端书下载 / 封面）必须带鉴权头；外部 URL（如 Kmoe）不带
+            if (url.startsWith(base)) builder.authed()
+            extraHeaders.forEach { (k, v) -> if (v.isNotBlank()) builder.header(k, v) }
             val req = builder.build()
             client.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code}")

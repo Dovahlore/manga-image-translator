@@ -5,6 +5,8 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.documentfile.provider.DocumentFile
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -24,6 +26,9 @@ class LibraryRepository(private val context: Context) {
     private val progressPrefs = context.getSharedPreferences("reading_progress", Context.MODE_PRIVATE)
     private val api = TranslationApi()
 
+    // 串行化导入：去重（读-查-写）必须原子，否则并发导入同一文件会重复建条目
+    private val importMutex = Mutex()
+
     private data class IndexData(val books: List<Book>, val folders: List<Folder>)
 
     /** 导入结果：book 为最终那本书（重复时是已存在的那本）；duplicate 表示内容已存在、未新建。 */
@@ -41,11 +46,14 @@ class LibraryRepository(private val context: Context) {
         if (t.isBlank()) null else readIndexData().books.firstOrNull { it.title == t }
     }
 
-    suspend fun import(uri: Uri): Book = withContext(Dispatchers.IO) {
+    suspend fun import(uri: Uri): Book = importResult(uri).book
+
+    /** 从 Uri 导入，返回完整结果（含是否重复）。扫描用：只统计真正新增的书。 */
+    suspend fun importResult(uri: Uri): ImportResult = withContext(Dispatchers.IO) {
         val name = displayNameOf(uri)
         val input = context.contentResolver.openInputStream(uri)
             ?: throw IllegalStateException("无法读取所选文件")
-        importFromStream(input, name).book
+        importFromStream(input, name)
     }
 
     /** 从本地文件导入（书库默认文件夹 / WebView 下载后的文件用）。返回是否命中已存在（重复）。 */
@@ -53,44 +61,49 @@ class LibraryRepository(private val context: Context) {
         importFromStream(file.inputStream(), file.name)
     }
 
-    private suspend fun importFromStream(input: InputStream, name: String?): ImportResult {
-        val id = UUID.randomUUID().toString()
-        val dir = File(root, id).apply { mkdirs() }
-        val src = File(dir, "book.src")
-        // 书名优先用「文件名」——那才是用户在文件管理器里认得的名字；
-        // 书内部元数据的标题常常和文件名对不上（比如 [Kmoe][尼古喵喵]卷01 内部叫「雅尼貓 - 卷01」）
-        val fromName = titleFromFileName(name)
-        input.use { it.copyTo(src.outputStream()) }
+    private suspend fun importFromStream(input: InputStream, name: String?): ImportResult =
+        importMutex.withLock {
+            val id = UUID.randomUUID().toString()
+            val dir = File(root, id).apply { mkdirs() }
+            val src = File(dir, "book.src")
+            // 书名优先用「文件名」——那才是用户在文件管理器里认得的名字；
+            // 书内部元数据的标题常常和文件名对不上（比如 [Kmoe][尼古喵喵]卷01 内部叫「雅尼貓 - 卷01」）
+            val fromName = titleFromFileName(name)
+            input.use { it.copyTo(src.outputStream()) }
 
-        val r = when (sniffFormat(src)) {
-            "mobi" -> MobiParser.extract(src, dir)
-            else -> EpubParser.extract(src, dir)
+            // 先算 hash 并去重：重复导入（比如「重新扫描」已导入过的压缩包）就跳过后面昂贵的解压，直接复用已有书
+            val hash = sha256(src)
+            val d0 = readIndexData()
+            val existing = d0.books.firstOrNull { it.hash.isNotEmpty() && it.hash == hash }
+            if (existing != null) {
+                dir.deleteRecursively()
+                ImportResult(existing, true)
+            } else {
+                val r = when (sniffFormat(src)) {
+                    "mobi" -> MobiParser.extract(src, dir)
+                    "zip", "rar" -> ArchiveParser.extract(src, dir)   // CBZ/CBR 漫画压缩包：直接按图页导入
+                    else -> EpubParser.extract(src, dir)
+                }
+                val fp = fingerprint(r.pages)
+                // 云端识别：同 hash 的云端书直接挂 cloudId（丢进 BOOKS 的、和云端同 hash 的书 → 识别成云端书）
+                val cloudId = runCatching { api.cloudLookup(hash) }.getOrNull()
+                val book = Book(
+                    id = id,
+                    title = fromName.ifBlank { r.title },
+                    mode = ReadingMode.MANGA,
+                    pageCount = r.pages.size,
+                    coverFile = r.pages.first(),
+                    pageFiles = r.pages,
+                    hash = hash,
+                    fingerprint = fp,
+                    cloudId = cloudId,
+                    createdAt = System.currentTimeMillis(),
+                )
+                val d = readIndexData()
+                writeIndex(d.books + book, d.folders)
+                ImportResult(book, false)
+            }
         }
-        val hash = sha256(src)
-        val fp = fingerprint(r.pages)
-        val d = readIndexData()
-        // 去重：同样源文件哈希的书已存在 → 直接返回已存在的那本，删掉刚导入的副本
-        d.books.firstOrNull { it.hash.isNotEmpty() && it.hash == hash }?.let { existing ->
-            dir.deleteRecursively()
-            return ImportResult(existing, true)
-        }
-        // 云端识别：同 hash 的云端书直接挂 cloudId（丢进 BOOKS 的、和云端同 hash 的书 → 识别成云端书）
-        val cloudId = runCatching { api.cloudLookup(hash) }.getOrNull()
-        val book = Book(
-            id = id,
-            title = fromName.ifBlank { r.title },
-            mode = ReadingMode.MANGA,
-            pageCount = r.pages.size,
-            coverFile = r.pages.first(),
-            pageFiles = r.pages,
-            hash = hash,
-            fingerprint = fp,
-            cloudId = cloudId,
-            createdAt = System.currentTimeMillis(),
-        )
-        writeIndex(d.books + book, d.folders)
-        return ImportResult(book, false)
-    }
 
     /** 默认书库文件夹（App 自己的外部存储 books 目录，安装即存在、无需授权）。 */
     fun defaultBooksDir(): File = File(context.getExternalFilesDir(null), "books").apply { mkdirs() }
@@ -114,7 +127,7 @@ class LibraryRepository(private val context: Context) {
         f
     }
 
-    /** 扫描「用户选的书库文件夹」（SAF）里的 epub/mobi，导入新书（按内容 hash 去重）。
+    /** 扫描「用户选的书库文件夹」（SAF）里的 epub/mobi/漫画压缩包，导入新书（按内容 hash 去重）。
      *  默认书库文件夹（App 私有）不扫：WebView 下载后已直接导入，那里只是暂存。 */
     suspend fun scanLibraryFolder(): Int = withContext(Dispatchers.IO) {
         var imported = 0
@@ -125,11 +138,12 @@ class LibraryRepository(private val context: Context) {
         for (f in folder.listFiles()) {
             if (!f.isFile) continue
             val name = f.name ?: continue
-            if (!name.endsWith(".epub", ignoreCase = true) && !name.endsWith(".mobi", ignoreCase = true)) continue
-            runCatching { import(f.uri) }
-                .onSuccess { book ->
-                    imported++
-                    recordSourceFile(book.hash, name)
+            if (!isSupportedName(name)) continue
+            runCatching { importResult(f.uri) }
+                .onSuccess { result ->
+                    // 只统计真正新增的；重复（内容 hash 已存在）不算，避免「重新扫描」误报 3 本
+                    if (!result.duplicate) imported++
+                    recordSourceFile(result.book.hash, name)
                 }
         }
         imported
@@ -179,7 +193,19 @@ class LibraryRepository(private val context: Context) {
         return name.substringBeforeLast('.').trim()
     }
 
-    /** 按文件头嗅探格式：MOBI 的 PDB 头 60..68 字节是 "BOOK"+"MOBI"，EPUB 是 "PK\x03\x04"。 */
+    /** 支持导入的文件名：epub / mobi / azw3 / 漫画压缩包(zip,rar,cbz,cbr)。 */
+    fun isSupportedName(name: String): Boolean {
+        val n = name.lowercase()
+        return n.endsWith(".epub") || n.endsWith(".mobi") || n.endsWith(".azw") || n.endsWith(".azw3") ||
+            n.endsWith(".zip") || n.endsWith(".rar") || n.endsWith(".cbz") || n.endsWith(".cbr")
+    }
+
+    /**
+     * 按文件头嗅探格式，返回 "mobi" / "epub" / "zip" / "rar"：
+     * - MOBI：PDB 头 60..68 字节是 "BOOK"+"MOBI"
+     * - ZIP（PK\x03\x04）：里面第一个条目是 mimetype=application/epub+zip → EPUB，否则当漫画压缩包(CBZ)
+     * - RAR：Rar!\x1a\x07
+     */
     private fun sniffFormat(f: File): String {
         f.inputStream().use { ins ->
             val head = ByteArray(68)
@@ -189,16 +215,31 @@ class LibraryRepository(private val context: Context) {
                     String(head, 64, 4, Charsets.US_ASCII) == "MOBI"
                 ) return "mobi"
             }
+            if (n >= 6 && head[0] == 'R'.code.toByte() && head[1] == 'a'.code.toByte() &&
+                head[2] == 'r'.code.toByte() && head[3] == '!'.code.toByte() &&
+                head[4] == 0x1A.toByte() && head[5] == 0x07.toByte()
+            ) return "rar"
             if (n >= 4 && head[0] == 0x50.toByte() && head[1] == 0x4B.toByte() &&
                 head[2] == 0x03.toByte() && head[3] == 0x04.toByte()
-            ) return "epub"
+            ) return if (isEpubZip(f)) "epub" else "zip"
         }
         // 退路：按扩展名
         return when (f.extension.lowercase()) {
             "mobi", "azw", "azw3", "prc" -> "mobi"
+            "cbz" -> "zip"
+            "cbr", "rar" -> "rar"
+            "zip" -> "zip"
             else -> "epub"
         }
     }
+
+    /** ZIP 里 mimetype 条目内容为 application/epub+zip → 是 EPUB；没有/不是 → 当漫画压缩包。 */
+    private fun isEpubZip(f: File): Boolean = runCatching {
+        ZipFile(f).use { zip ->
+            val e = zip.getEntry("mimetype") ?: return@use false
+            zip.getInputStream(e).bufferedReader(Charsets.UTF_8).readText().trim() == "application/epub+zip"
+        }
+    }.getOrDefault(false)
 
     suspend fun delete(id: String) = withContext(Dispatchers.IO) {
         File(root, id).deleteRecursively()
@@ -255,9 +296,12 @@ class LibraryRepository(private val context: Context) {
         val d = readIndexData()
         val newName = name.trim()
         writeIndex(d.books, d.folders.map { if (it.id == id) it.copy(name = newName) else it })
-        // 已同步书：该夹下所有同步书的云端 folder 名跟着改
+        // 已同步书：该夹下所有同步书的云端 folder 名跟着改（失败=离线，进待同步队列，下次在线补）
         for (b in d.books) {
-            if (b.folderId == id && b.cloudId != null) runCatching { api.cloudUpdateFolder(b.cloudId, newName) }
+            if (b.folderId == id && b.cloudId != null) {
+                val ok = runCatching { api.cloudUpdateFolder(b.cloudId, newName) }.getOrDefault(false)
+                if (!ok) recordFolderSync(b.cloudId, newName)
+            }
         }
     }
 
@@ -267,9 +311,12 @@ class LibraryRepository(private val context: Context) {
             d.books.map { if (it.folderId == id) it.copy(folderId = null) else it },
             d.folders.filterNot { it.id == id },
         )
-        // 已同步书：该夹下同步书移出未分类
+        // 已同步书：该夹下同步书移出未分类（失败=离线，进待同步队列）
         for (b in d.books) {
-            if (b.folderId == id && b.cloudId != null) runCatching { api.cloudUpdateFolder(b.cloudId, null) }
+            if (b.folderId == id && b.cloudId != null) {
+                val ok = runCatching { api.cloudUpdateFolder(b.cloudId, null) }.getOrDefault(false)
+                if (!ok) recordFolderSync(b.cloudId, "")
+            }
         }
     }
 
@@ -277,11 +324,12 @@ class LibraryRepository(private val context: Context) {
     suspend fun moveBook(bookId: String, folderId: String?) = withContext(Dispatchers.IO) {
         val d = readIndexData()
         writeIndex(d.books.map { if (it.id == bookId) it.copy(folderId = folderId) else it }, d.folders)
-        // 已同步的书：收藏夹变化同步到云端
+        // 已同步的书：收藏夹变化同步到云端（失败=离线，进待同步队列）
         val book = d.books.find { it.id == bookId } ?: return@withContext
         if (book.cloudId != null) {
             val name = folderId?.let { fid -> d.folders.find { it.id == fid }?.name }
-            runCatching { api.cloudUpdateFolder(book.cloudId, name) }
+            val ok = runCatching { api.cloudUpdateFolder(book.cloudId, name) }.getOrDefault(false)
+            if (!ok) recordFolderSync(book.cloudId, name ?: "")
         }
     }
 
@@ -291,6 +339,46 @@ class LibraryRepository(private val context: Context) {
         if (t.isBlank()) return@withContext
         val d = readIndexData()
         writeIndex(d.books.map { if (it.id == bookId) it.copy(title = t) else it }, d.folders)
+    }
+
+    // ---- 离线收藏夹补同步：移动/重命名/删除收藏夹时，对已同步书的云端 folder 变更先试一次，
+    //      失败（离线）记进 pending，下次在线由 drainFolderSyncs 补发，避免云端 folder 与本地不一致 ----
+
+    private val folderSyncPrefs get() = context.getSharedPreferences("folder_sync", Context.MODE_PRIVATE)
+
+    private fun pendingFolderSyncs(): MutableMap<String, String> {
+        val raw = folderSyncPrefs.getString("pending", null) ?: return mutableMapOf()
+        return runCatching {
+            val o = JSONObject(raw)
+            val m = mutableMapOf<String, String>()
+            o.keys().forEach { k -> m[k] = o.optString(k) }
+            m
+        }.getOrDefault(mutableMapOf())
+    }
+
+    private fun persistFolderSyncs(map: Map<String, String>) {
+        val o = JSONObject()
+        map.forEach { (k, v) -> o.put(k, v) }
+        folderSyncPrefs.edit().putString("pending", o.toString()).apply()
+    }
+
+    private fun recordFolderSync(cloudId: String, folderName: String) {
+        val m = pendingFolderSyncs()
+        m[cloudId] = folderName
+        persistFolderSyncs(m)
+    }
+
+    /** 补同步收藏夹：对每条 pending（cloudId -> folder名，空串=未分类）调 cloudUpdateFolder，成功移除、失败保留。 */
+    suspend fun drainFolderSyncs() = withContext(Dispatchers.IO) {
+        val m = pendingFolderSyncs()
+        if (m.isEmpty()) return@withContext
+        val remaining = mutableMapOf<String, String>()
+        for ((cloudId, name) in m) {
+            val folder = name.takeIf { it.isNotBlank() }
+            val ok = runCatching { api.cloudUpdateFolder(cloudId, folder) }.getOrDefault(false)
+            if (!ok) remaining[cloudId] = name
+        }
+        persistFolderSyncs(remaining)
     }
 
     // ---------------------------------------------------------------- 云同步
@@ -469,7 +557,10 @@ class LibraryRepository(private val context: Context) {
         }
     }
 
-    /** 打包：book.src + pages 目录 + manifest.json（译文不打进 zip，直接从服务端拉最新）。 */
+    /** 打包：pages 目录 + manifest.json。
+     *  ★ 不打 book.src：源文件（epub/mobi/rar）里的图就是 pages 那批图，再放一遍等于存两份。
+     *     服务端 translate-from-zip / 封面 / 下载还原都只用 pages 里的图，book.src 完全用不上。
+     *     去掉后云端体积直接减半。 */
     private fun packBook(book: Book, zipFile: File) {
         ZipOutputStream(zipFile.outputStream().buffered()).use { zos ->
             fun add(name: String, file: File) {
@@ -488,7 +579,6 @@ class LibraryRepository(private val context: Context) {
             zos.putNextEntry(ZipEntry("manifest.json"))
             zos.write(manifest.toString().toByteArray(Charsets.UTF_8))
             zos.closeEntry()
-            add("book.src", epubFile(book.id))
             for (f in book.pageFiles) add("pages/${f.name}", f)
         }
     }

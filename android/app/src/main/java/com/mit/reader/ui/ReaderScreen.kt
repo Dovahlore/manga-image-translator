@@ -85,6 +85,20 @@ fun ReaderScreen(bookId: String, onBack: () -> Unit) {
         app.library.book(bookId)?.let(vm::load)
     }
 
+    // 后台「全书翻译」进行中时，定期从服务端补拉译文页：
+    // pageTranslated 是 SharedFlow 不 replay——阅读器不在前台期间（比如切去浏览收藏夹）事件会被丢，
+    // 这里每 3 秒兜底一次，保证「回到阅读器 / 切到别的收藏夹再回来」也能实时看到新翻好的页。
+    val translatingBookId = app.translatingBookId
+    val queuedBookIds = app.queuedBookIds
+    val isTranslatingThis = translatingBookId == bookId || bookId in queuedBookIds
+    LaunchedEffect(bookId, isTranslatingThis) {
+        if (!isTranslatingThis) return@LaunchedEffect
+        while (true) {
+            vm.refreshFromServer()
+            delay(3000)
+        }
+    }
+
     val book = vm.book ?: return
     val pagerState = rememberPagerState(
         initialPage = vm.currentPage,

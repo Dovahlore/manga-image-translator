@@ -21,7 +21,7 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
-            <!-- 用外部程序「打开」epub / mobi → 出现在应用选择列表，选中后导入并进阅读器 -->
+            <!-- 用外部程序「打开」epub / mobi / 漫画压缩包 → 出现在应用选择列表，选中后导入并进阅读器 -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
@@ -30,6 +30,15 @@
                 <data android:mimeType="application/x-mobipocket-ebook" />
                 <data android:mimeType="application/vnd.amazon.ebook" />
                 <data android:mimeType="application/x-mobi" />
+                <!-- 漫画压缩包 CBZ/CBR 与普通 zip/rar -->
+                <data android:mimeType="application/vnd.comicbook+zip" />
+                <data android:mimeType="application/vnd.comicbook-rar" />
+                <data android:mimeType="application/x-cbz" />
+                <data android:mimeType="application/x-cbr" />
+                <data android:mimeType="application/zip" />
+                <data android:mimeType="application/x-zip-compressed" />
+                <data android:mimeType="application/x-rar-compressed" />
+                <data android:mimeType="application/vnd.rar" />
             </intent-filter>
 
             <!-- 兜底：部分文件管理器给的是 octet-stream，用扩展名匹配 content:// -->
@@ -40,6 +49,10 @@
                 <data android:scheme="content" android:host="*" android:pathPattern=".*\\.mobi" />
                 <data android:scheme="content" android:host="*" android:pathPattern=".*\\.azw3" />
                 <data android:scheme="content" android:host="*" android:pathPattern=".*\\.azw" />
+                <data android:scheme="content" android:host="*" android:pathPattern=".*\\.cbz" />
+                <data android:scheme="content" android:host="*" android:pathPattern=".*\\.cbr" />
+                <data android:scheme="content" android:host="*" android:pathPattern=".*\\.zip" />
+                <data android:scheme="content" android:host="*" android:pathPattern=".*\\.rar" />
             </intent-filter>
 
             <!-- 兜底：老式 file:// 路径 -->
@@ -50,14 +63,23 @@
                 <data android:scheme="file" android:host="*" android:pathPattern=".*\\.mobi" />
                 <data android:scheme="file" android:host="*" android:pathPattern=".*\\.azw3" />
                 <data android:scheme="file" android:host="*" android:pathPattern=".*\\.azw" />
+                <data android:scheme="file" android:host="*" android:pathPattern=".*\\.cbz" />
+                <data android:scheme="file" android:host="*" android:pathPattern=".*\\.cbr" />
+                <data android:scheme="file" android:host="*" android:pathPattern=".*\\.zip" />
+                <data android:scheme="file" android:host="*" android:pathPattern=".*\\.rar" />
             </intent-filter>
 
-            <!-- 从别的 App「分享」epub/mobi 过来 -->
+            <!-- 从别的 App「分享」epub/mobi/漫画压缩包过来 -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:mimeType="application/epub+zip" />
                 <data android:mimeType="application/x-mobipocket-ebook" />
+                <data android:mimeType="application/vnd.comicbook+zip" />
+                <data android:mimeType="application/vnd.comicbook-rar" />
+                <data android:mimeType="application/zip" />
+                <data android:mimeType="application/x-rar-compressed" />
+                <data android:mimeType="application/vnd.rar" />
             </intent-filter>
         </activity>
     </application>

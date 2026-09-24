@@ -73,7 +73,7 @@ class ReaderViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     /** 从服务端补拉译文页到本地（只补缺失/指纹变化的页），再标 DONE。 */
-    private fun refreshFromServer() {
+    fun refreshFromServer() {
         val b = book ?: return
         viewModelScope.launch {
             val doneIdx = readerApp.library.refreshTranslations(b, overwrite = false)

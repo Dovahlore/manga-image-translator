@@ -161,14 +161,14 @@ fun SettingsScreen(onBack: () -> Unit) {
                 modifier = Modifier.padding(top = 8.dp),
             )
 
-            // ---- 书库文件夹（自动扫描导入 epub/mobi）----
+            // ---- 书库文件夹（自动扫描导入 epub/mobi/漫画压缩包）----
             Text(
                 "书库文件夹（自动扫描导入）",
                 style = MaterialTheme.typography.titleMedium,
                 modifier = Modifier.padding(top = 24.dp),
             )
             Text(
-                if (folderName.isNullOrBlank()) "未选择：点「选择文件夹」指定一个目录，App 会自动扫描其中的 .epub / .mobi 并导入（按内容去重）。"
+                if (folderName.isNullOrBlank()) "未选择：点「选择文件夹」指定一个目录，App 会自动扫描其中的 .epub / .mobi / .zip / .rar / .cbz / .cbr 并导入（按内容去重）。"
                 else "当前：$folderName",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -181,6 +181,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                         scanResult = "扫描中…"
                         scope.launch {
                             val n = runCatching { app.library.scanLibraryFolder() }.getOrDefault(-1)
+                            if (n > 0) app.bumpLibrary()   // 新书入库，书库页立即刷新
                             scanResult = if (n >= 0) "扫描完成，新导入 $n 本" else "扫描失败（离线或无法访问文件夹）"
                         }
                     },

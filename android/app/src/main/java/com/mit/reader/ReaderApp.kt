@@ -319,12 +319,14 @@ class ReaderApp : Application() {
             if (scanned > 0) bumpLibrary()   // 扫到新书：书库页刷新
             runCatching { drainPendingDeletes() }
             runCatching { drainPendingCancels() }
+            runCatching { library.drainFolderSyncs() }   // 离线期间移动/重命名/删除收藏夹的云端 folder 补同步
             runCatching { syncAllBooks() }
             // 之后每 5 分钟只同步（不再扫文件夹）
             while (true) {
                 delay(5 * 60 * 1000)
                 runCatching { drainPendingDeletes() }
                 runCatching { drainPendingCancels() }
+                runCatching { library.drainFolderSyncs() }
                 runCatching { syncAllBooks() }
             }
         }
