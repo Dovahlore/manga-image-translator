@@ -104,7 +104,34 @@ async def _cleanup_cache_files(days: int) -> int:
     return n
 
 
+async def _cleanup_synced_orig() -> int:
+    """同步书（有 zip）的 orig.png 是冗余副本：删掉并置空 orig_path（原图按需从 zip 读）。"""
+    rows = await run_in_threadpool(db.query, "SELECT id FROM books WHERE zip_path IS NOT NULL")
+    n = 0
+    for r in rows:
+        d = S.BOOKS_DIR / _safe(r["id"])
+        if not d.exists():
+            continue
+        for p in d.rglob("orig.png"):
+            try:
+                p.unlink(missing_ok=True)
+                n += 1
+            except Exception:      # noqa: BLE001
+                pass
+    if rows:
+        await run_in_threadpool(
+            db.execute,
+            "UPDATE pages SET orig_path=NULL "
+            "WHERE book_id IN (SELECT id FROM books WHERE zip_path IS NOT NULL)")
+    return n
+
+
 async def _cleanup_expired_once() -> None:
+    # 同步书原图去重：无论保留期如何都清（原图在 zip 里，本地 orig.png 是冗余副本）
+    n_orig = await _cleanup_synced_orig()
+    if n_orig:
+        print(f"[app-api] 同步书原图去重：删 {n_orig} 个冗余 orig.png", flush=True)
+
     days = S.RETENTION_DAYS
     if days <= 0:
         return
@@ -752,7 +779,9 @@ def _persist_page(book_id, owner, page_index, order_dir, title, img_sha, cfg_has
         (book_id, title, order_dir, owner))
     orig_path, out_path, json_path = page_paths(book_id, page_index)
     orig_path.parent.mkdir(parents=True, exist_ok=True)
-    if raw:
+    # 同步书（有 zip）的原图已经在 zip 里，不再重复落盘 orig.png（省空间）；原图按需从 zip 读
+    synced = db.query_one("SELECT 1 FROM books WHERE id=%s AND zip_path IS NOT NULL", (book_id,))
+    if raw and synced is None:
         orig_path.write_bytes(raw)
     # 先写文件再落页记录：避免页已标 done 但 out 图还没写好，App 轮询到 done 立刻下载 → 404
     if out_bytes:
@@ -770,7 +799,7 @@ def _persist_page(book_id, owner, page_index, order_dir, title, img_sha, cfg_has
              status=VALUES(status), attempts=attempts+VALUES(attempts), error=VALUES(error),
              elapsed_ms=VALUES(elapsed_ms), tokens=VALUES(tokens)""",
         (book_id, page_index, order_dir, img_sha, cfg_hash,
-         str(orig_path), str(out_path) if out_bytes else None,
+         str(orig_path) if synced is None else None, str(out_path) if out_bytes else None,
          str(json_path) if payload else None, status, attempts, error, elapsed_ms, tokens))
     row = db.query_one("SELECT id FROM pages WHERE book_id=%s AND page_index=%s", (book_id, page_index))
     page_id = row["id"]
@@ -833,6 +862,12 @@ async def page_image(page_id: int, orig: int = Query(0, description="1=原图"),
         raise HTTPException(404, detail="page not found")
     path = row["orig_path"] if orig else (row["out_path"] or row["orig_path"])
     if not path or not Path(path).exists():
+        if orig:
+            # 同步书的原图在 zip 里，按需读出来返回
+            raw = await run_in_threadpool(_read_book_page_bytes, row["book_id"], row["page_index"], owner)
+            if raw is not None:
+                return Response(content=raw, media_type="image/png",
+                                headers={"Cache-Control": "public, max-age=31536000, immutable"})
         raise HTTPException(404, detail="image not available")
     media = "image/webp" if str(path).lower().endswith(".webp") else "image/png"
     return FileResponse(path, media_type=media,
@@ -863,10 +898,16 @@ async def retranslate(page_id: int, body: Optional[dict] = None, owner: str = De
     row = await run_in_threadpool(db.query_one, "SELECT * FROM pages WHERE id=%s", (page_id,))
     if not row:
         raise HTTPException(404, detail="page not found")
-    orig = Path(row["orig_path"] or "")
-    if not orig.exists():
+    raw = None
+    if row["orig_path"]:
+        p = Path(row["orig_path"])
+        if p.exists():
+            raw = p.read_bytes()
+    if raw is None:
+        # 同步书的原图在 zip 里，按需读
+        raw = await run_in_threadpool(_read_book_page_bytes, row["book_id"], row["page_index"], owner)
+    if raw is None:
         raise HTTPException(410, detail="原图已不在本地，无法重译")
-    raw = orig.read_bytes()
 
     overrides = body.get("config") or {}
     cfg = deep_merge(S.DEFAULT_CONFIG, overrides)
@@ -1287,6 +1328,15 @@ async def _migrate_book(old_id: str, new_id: str, owner: str) -> None:
     await run_in_threadpool(db.execute, "UPDATE page_context SET book_id=%s WHERE book_id=%s", (new_id, old_id))
     await run_in_threadpool(db.execute, "DELETE FROM books WHERE id=%s", (old_id,))
     _mark_book_deleted(old_id)   # 墓碑：同步时旧本地 UUID 下的后台翻译别再把它翻回来
+
+    # 原图已经在云端 zip 里，删掉迁移过来的 orig.png 副本（省空间），DB 里 orig_path 置空，按需从 zip 读
+    if new_dir.exists():
+        for p in new_dir.rglob("orig.png"):
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:      # noqa: BLE001
+                pass
+    await run_in_threadpool(db.execute, "UPDATE pages SET orig_path=NULL WHERE book_id=%s", (new_id,))
 
 
 @app.post("/v1/cloud/books", dependencies=[Depends(auth)])
