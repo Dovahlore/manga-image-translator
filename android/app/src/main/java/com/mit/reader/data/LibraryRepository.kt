@@ -101,6 +101,7 @@ class LibraryRepository(private val context: Context) {
                 )
                 val d = readIndexData()
                 writeIndex(d.books + book, d.folders)
+                src.delete()   // 源文件已解压成 pages/、hash 已存 index，删掉 book.src 省一半空间
                 ImportResult(book, false)
             }
         }
@@ -248,6 +249,31 @@ class LibraryRepository(private val context: Context) {
         writeIndex(d.books.filterNot { it.id == id }, d.folders)
     }
 
+    /** 启动清理：删掉导入后冗余的 book.src、失败同步/下载遗留的 zip、以及已删书的孤儿目录。
+     *  幂等，可每次启动跑一遍（之后就是 no-op）。 */
+    suspend fun cleanupOrphans() = withContext(Dispatchers.IO) {
+        val ids = readIndexData().books.map { it.id }.toSet()
+
+        // 1) 删每本书的 book.src（内容已解压到 pages/、hash 已存 index，源文件冗余 → 省一半空间）
+        ids.forEach { id ->
+            File(root, id).resolve("book.src").takeIf { it.exists() }?.delete()
+        }
+
+        // 2) 删已删书的孤儿目录（root 里不在 index 的子目录）
+        root.listFiles { f -> f.isDirectory }?.forEach { dir ->
+            if (dir.name !in ids) dir.deleteRecursively()
+        }
+
+        // 3) 删已删书的译文缓存孤儿目录
+        translatedRoot.listFiles { f -> f.isDirectory }?.forEach { dir ->
+            if (dir.name !in ids) dir.deleteRecursively()
+        }
+
+        // 4) 删失败同步/下载遗留的 zip（正常流程结束会删，这里兜底历史遗留）
+        context.cacheDir.listFiles { f -> f.isFile && (f.name.startsWith("sync-") || f.name.startsWith("dl-")) }
+            ?.forEach { it.delete() }
+    }
+
     /** 删书时同步删除源文件（默认书库文件夹 + SAF 文件夹都查，按内容 hash 定位文件名）。 */
     suspend fun deleteSourceFile(hash: String): Boolean = withContext(Dispatchers.IO) {
         if (hash.isBlank()) return@withContext false
@@ -389,25 +415,28 @@ class LibraryRepository(private val context: Context) {
         onProgress?.invoke("打包中…", null)
         val zipFile = File(context.cacheDir, "sync-${book.id}.zip")
         if (zipFile.exists()) zipFile.delete()
-        packBook(book, zipFile)
-        val folderName = book.folderId?.let { fid -> readIndexData().folders.find { it.id == fid }?.name }
-        val resp = api.cloudUpload(
-            zip = zipFile,
-            title = book.title,
-            folder = folderName,
-            mode = if (book.mode == ReadingMode.NORMAL) "normal" else "manga",
-            hash = book.hash.ifBlank { sha256(epubFile(book.id)) },
-            fingerprint = book.fingerprint,
-            pageCount = book.pageCount,
-            oldBookId = book.id,   // 先翻译后同步：把本地 UUID 下的旧译文迁到 cloudId
-            onProgress = { sent, total -> onProgress?.invoke("上传中…", if (total > 0) sent.toFloat() / total else null) },
-        )
-        zipFile.delete()
-        // 缓存封面：删本地后云端 tab 仍能显示封面
-        runCatching { book.coverFile.copyTo(cloudCoverFile(resp.bookId), overwrite = true) }
-        val d = readIndexData()
-        writeIndex(d.books.map { if (it.id == book.id) it.copy(cloudId = resp.bookId) else it }, d.folders)
-        readIndexData().books.find { it.id == book.id } ?: book
+        try {
+            packBook(book, zipFile)
+            val folderName = book.folderId?.let { fid -> readIndexData().folders.find { it.id == fid }?.name }
+            val resp = api.cloudUpload(
+                zip = zipFile,
+                title = book.title,
+                folder = folderName,
+                mode = if (book.mode == ReadingMode.NORMAL) "normal" else "manga",
+                hash = book.hash.ifBlank { sha256(epubFile(book.id)) },
+                fingerprint = book.fingerprint,
+                pageCount = book.pageCount,
+                oldBookId = book.id,   // 先翻译后同步：把本地 UUID 下的旧译文迁到 cloudId
+                onProgress = { sent, total -> onProgress?.invoke("上传中…", if (total > 0) sent.toFloat() / total else null) },
+            )
+            // 缓存封面：删本地后云端 tab 仍能显示封面
+            runCatching { book.coverFile.copyTo(cloudCoverFile(resp.bookId), overwrite = true) }
+            val d = readIndexData()
+            writeIndex(d.books.map { if (it.id == book.id) it.copy(cloudId = resp.bookId) else it }, d.folders)
+            readIndexData().books.find { it.id == book.id } ?: book
+        } finally {
+            zipFile.delete()   // 成功/失败/取消都删，避免遗留大 zip 占空间
+        }
     }
 
     /** 取消同步：删云端（含翻译结果），本地保留，清空 cloudId。
@@ -442,53 +471,57 @@ class LibraryRepository(private val context: Context) {
         val dir = File(root, id).apply { mkdirs() }
         val zipFile = File(context.cacheDir, "dl-${cloud.id}.zip")
         if (zipFile.exists()) zipFile.delete()
-        api.cloudDownload(cloud.id, zipFile) { got, total ->
-            onProgress?.invoke("下载中…", if (total > 0) got.toFloat() / total else null)
-        }
-        onProgress?.invoke("还原中…", null)
-
+        val pagesDir = File(dir, "pages").apply { mkdirs() }
+        val translatedDir = File(translatedRoot, id).apply { mkdirs() }
         var title = cloud.title
         var mode = ReadingMode.MANGA
         var folderName: String? = cloud.folder
-        val pagesDir = File(dir, "pages").apply { mkdirs() }
-        val translatedDir = File(translatedRoot, id).apply { mkdirs() }
-
-        ZipFile(zipFile).use { zip ->
-            zip.getEntry("manifest.json")?.let { e ->
-                val m = JSONObject(zip.getInputStream(e).bufferedReader(Charsets.UTF_8).readText())
-                title = m.optString("title").takeIf { it.isNotBlank() } ?: title
-                mode = if (m.optString("mode") == "normal") ReadingMode.NORMAL else ReadingMode.MANGA
-                folderName = m.optString("folder").takeIf { it.isNotBlank() } ?: folderName
+        try {
+            api.cloudDownload(cloud.id, zipFile) { got, total ->
+                onProgress?.invoke("下载中…", if (total > 0) got.toFloat() / total else null)
             }
-            for (e in zip.entries()) {
-                if (e.isDirectory) continue
-                val name = e.name
-                when {
-                    name == "book.src" ->
-                        zip.getInputStream(e).use { it.copyTo(File(dir, "book.src").outputStream()) }
-                    name.startsWith("pages/") ->
-                        zip.getInputStream(e).use { it.copyTo(File(pagesDir, name.substringAfterLast('/')).outputStream()) }
-                    name.startsWith("translated/") ->
-                        zip.getInputStream(e).use { it.copyTo(File(translatedDir, name.substringAfterLast('/')).outputStream()) }
+            onProgress?.invoke("还原中…", null)
+
+            ZipFile(zipFile).use { zip ->
+                zip.getEntry("manifest.json")?.let { e ->
+                    val m = JSONObject(zip.getInputStream(e).bufferedReader(Charsets.UTF_8).readText())
+                    title = m.optString("title").takeIf { it.isNotBlank() } ?: title
+                    mode = if (m.optString("mode") == "normal") ReadingMode.NORMAL else ReadingMode.MANGA
+                    folderName = m.optString("folder").takeIf { it.isNotBlank() } ?: folderName
+                }
+                for (e in zip.entries()) {
+                    if (e.isDirectory) continue
+                    val name = e.name
+                    when {
+                        name == "book.src" ->
+                            zip.getInputStream(e).use { it.copyTo(File(dir, "book.src").outputStream()) }
+                        name.startsWith("pages/") ->
+                            zip.getInputStream(e).use { it.copyTo(File(pagesDir, name.substringAfterLast('/')).outputStream()) }
+                        name.startsWith("translated/") ->
+                            zip.getInputStream(e).use { it.copyTo(File(translatedDir, name.substringAfterLast('/')).outputStream()) }
+                    }
                 }
             }
+        } finally {
+            zipFile.delete()   // 成功/失败/取消都删，避免遗留大 zip 占空间
         }
-        zipFile.delete()
 
         val pages = pagesDir.listFiles { f -> f.isFile }?.sortedBy { it.name } ?: emptyList()
         if (pages.isEmpty()) throw IllegalStateException("云端书 zip 里没有页面")
 
         val srcFile = File(dir, "book.src")
         val hash = if (srcFile.exists()) sha256(srcFile) else (cloud.hash ?: "")
+        srcFile.delete()   // book.src 冗余（图都在 pages/），删掉省一半空间
         val fp = if (pages.isNotEmpty()) fingerprint(pages) else ""
 
         val d = readIndexData()
         var folders = d.folders
         var folderId: String? = null
-        if (!folderName.isNullOrBlank()) {
-            folderId = folders.find { it.name == folderName }?.id
+        val fname = folderName   // 局部 val：folderName 是 var 且在闭包里被改过，先固化避免 smart cast 失败
+        if (!fname.isNullOrBlank()) {
+            folderId = folders.find { it.name == fname }?.id
             if (folderId == null) {
-                val f = Folder(UUID.randomUUID().toString(), folderName)
+                val f = Folder(UUID.randomUUID().toString(), fname)
                 folders = folders + f
                 folderId = f.id
             }

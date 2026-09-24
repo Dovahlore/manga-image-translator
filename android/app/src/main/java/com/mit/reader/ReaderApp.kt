@@ -374,6 +374,8 @@ class ReaderApp : Application() {
      *  只补差异，不全量，避免卡顿。 */
     private fun startBackgroundSync() {
         appScope.launch {
+            // 启动清理：删冗余 book.src + 失败同步/下载遗留的 zip + 已删书的孤儿目录（幂等）
+            runCatching { library.cleanupOrphans() }
             delay(1500)
             // 打开时：先扫书库文件夹（识别云端书），再同步（把识别成云端书后缺的远程译文拉下来）
             val scanned = runCatching { library.scanLibraryFolder() }.getOrDefault(0)
