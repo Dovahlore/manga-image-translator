@@ -72,11 +72,11 @@ class ReaderViewModel(private val app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** 从服务端补拉译文页到本地（只补缺失/指纹变化的页），再标 DONE。 */
+    /** 从服务端补拉译文页到本地（只补缺失/指纹变化的页），再标 DONE。优先拉当前页附近的页。 */
     fun refreshFromServer() {
         val b = book ?: return
         viewModelScope.launch {
-            val doneIdx = readerApp.library.refreshTranslations(b, overwrite = false)
+            val doneIdx = readerApp.library.refreshTranslations(b, overwrite = false, priority = currentPage)
             for (i in doneIdx) {
                 pageStates[i] = PageState(
                     status = PageStatus.DONE,

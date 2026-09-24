@@ -558,14 +558,17 @@ class LibraryRepository(private val context: Context) {
 
     /** 从服务端拉该书已翻好的页到本地译文缓存（只补差异，不全量）。
      *  overwrite=true 强制覆盖本地（别的设备重翻后同步）；false 只下载「本地缺失」或「服务端指纹变了」的页。
+     *  priority=优先下载的页（阅读器传当前页）：按距离排序，让「正在看的那几页」先就绪，翻页更顺。
      *  返回本次已就绪的页索引。 */
-    suspend fun refreshTranslations(book: Book, overwrite: Boolean): Set<Int> = withContext(Dispatchers.IO) {
+    suspend fun refreshTranslations(book: Book, overwrite: Boolean, priority: Int? = null): Set<Int> = withContext(Dispatchers.IO) {
         val done = mutableSetOf<Int>()
         val pages = runCatching { api.bookPages(book.serverId) }.getOrNull() ?: return@withContext done
+        // 阅读器打开时：先拉当前页附近的页（当前页 → ±1 → ±2 → …），再补其余
+        val ordered = if (priority != null) pages.sortedBy { kotlin.math.abs(it.pageIndex - priority) } else pages
         val metaFile = syncMetaFile(book.id)
         val meta = readSyncMeta(metaFile)
         var metaChanged = false
-        for (p in pages) {
+        for (p in ordered) {
             if (p.status != "done" || p.pageIndex !in book.pageFiles.indices) continue
             val f = translatedCacheFile(book.id, p.pageIndex)
             val fp = "${p.configHash}|${p.updatedAt}"

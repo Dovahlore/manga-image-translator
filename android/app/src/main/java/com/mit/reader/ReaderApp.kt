@@ -384,13 +384,15 @@ class ReaderApp : Application() {
             runCatching { drainPendingCancels() }
             runCatching { library.drainFolderSyncs() }   // 离线期间移动/重命名/删除收藏夹的云端 folder 补同步
             runCatching { syncAllBooks() }
-            // 之后每 5 分钟只同步（不再扫文件夹）
+            // 之后每 5 分钟：补删/补取消/补同步收藏夹照常；译文补拉降频到每 15 分钟，减少 bookPages 请求
+            var tick = 0
             while (true) {
                 delay(5 * 60 * 1000)
                 runCatching { drainPendingDeletes() }
                 runCatching { drainPendingCancels() }
                 runCatching { library.drainFolderSyncs() }
-                runCatching { syncAllBooks() }
+                tick++
+                if (tick % 3 == 0) runCatching { syncAllBooks() }   // 每 3 轮 = 15 分钟
             }
         }
     }
