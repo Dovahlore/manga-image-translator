@@ -44,6 +44,10 @@ import kotlinx.coroutines.launch
 /** Kmoe 默认地址。 */
 const val KMOE_URL = "https://www.koz.moe/"
 
+/** 桌面版 User-Agent：让站点返回电脑端页面（手机版功能少）。 */
+private const val DESKTOP_UA =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
 /** URL 里的文件名常是 %XX 转义（如 %5BMobi%5D%5BKmoe%5D），解码成可读名并去掉路径非法字符。 */
 private fun decodeFileName(raw: String): String {
     val decoded = runCatching {
@@ -114,6 +118,8 @@ fun KmoeScreen(onBack: () -> Unit) {
                     settings.javaScriptEnabled = true
                     settings.domStorageEnabled = true
                     settings.cacheMode = WebSettings.LOAD_DEFAULT
+                    // 桌面模式：用桌面 UA 让站点返回电脑端页面
+                    settings.userAgentString = DESKTOP_UA
                     // 允许双指捏合缩放，隐藏系统 +/- 按钮
                     settings.setSupportZoom(true)
                     settings.builtInZoomControls = true
@@ -128,10 +134,11 @@ fun KmoeScreen(onBack: () -> Unit) {
                             super.onPageFinished(view, url)
                             // 记下当前页，退出重进恢复
                             url?.takeIf { it.isNotBlank() }?.let { ServerConfig.kmoeLastUrl = it }
-                            // 强制允许缩放：不少站点 viewport 带 user-scalable=no / maximum-scale=1
+                            // 强制宽视口 + 允许缩放：配合桌面 UA 渲染电脑端布局（无 meta 就注入一个 1280 宽的）
                             view?.evaluateJavascript(
                                 "var m=document.querySelector('meta[name=viewport]');" +
-                                    "if(m){m.setAttribute('content','width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes');}",
+                                    "if(!m){m=document.createElement('meta');m.name='viewport';document.head.appendChild(m);}" +
+                                    "m.setAttribute('content','width=1280, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes');",
                                 null,
                             )
                         }
