@@ -6,6 +6,8 @@
   "labels": ["dependencies"],
   "prHourlyLimit": 4,
   "prConcurrentLimit": 10,
+  "automerge": true,
+  "automergeType": "branch",
   "packageRules": [
     {
       "matchManagers": ["gradle"],
@@ -14,6 +16,11 @@
     {
       "matchManagers": ["pip_requirements"],
       "groupName": "Python 依赖"
+    },
+    {
+      "matchUpdateTypes": ["major"],
+      "automerge": false,
+      "labels": ["dependencies", "major"]
     }
   ]
 }
