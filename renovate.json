@@ -1,0 +1,19 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "timezone": "Asia/Shanghai",
+  "schedule": ["every weekend"],
+  "labels": ["dependencies"],
+  "prHourlyLimit": 4,
+  "prConcurrentLimit": 10,
+  "packageRules": [
+    {
+      "matchManagers": ["gradle"],
+      "groupName": "Android 依赖"
+    },
+    {
+      "matchManagers": ["pip_requirements"],
+      "groupName": "Python 依赖"
+    }
+  ]
+}
