@@ -126,11 +126,29 @@ async def _cleanup_synced_orig() -> int:
     return n
 
 
+async def _cleanup_result_json() -> int:
+    """result.json 已停写（结构化结果在 page_blocks 表），删历史遗留的 result.json 并置空 json_path。"""
+    n = 0
+    for p in S.BOOKS_DIR.rglob("result.json"):
+        try:
+            p.unlink(missing_ok=True)
+            n += 1
+        except Exception:      # noqa: BLE001
+            pass
+    if n:
+        await run_in_threadpool(db.execute, "UPDATE pages SET json_path=NULL")
+    return n
+
+
 async def _cleanup_expired_once() -> None:
     # 同步书原图去重：无论保留期如何都清（原图在 zip 里，本地 orig.png 是冗余副本）
     n_orig = await _cleanup_synced_orig()
     if n_orig:
         print(f"[app-api] 同步书原图去重：删 {n_orig} 个冗余 orig.png", flush=True)
+    # result.json 去重：已停写，清历史遗留
+    n_json = await _cleanup_result_json()
+    if n_json:
+        print(f"[app-api] result.json 去重：删 {n_json} 个冗余 result.json", flush=True)
 
     days = S.RETENTION_DAYS
     if days <= 0:
@@ -440,6 +458,30 @@ def _to_webp_lossless(data: bytes) -> bytes:
         return out if len(out) < len(data) else data   # 万一更大就保留原 PNG
     except Exception:      # noqa: BLE001
         return data
+
+
+def _image_ext(data: bytes) -> str:
+    """按文件头魔数判断图片扩展名（用于缓存封面等场景）。"""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    return ".png"   # 兜底按 PNG 处理
+
+
+def _guess_image_media(name: str) -> str:
+    n = name.lower()
+    if n.endswith(".png"):
+        return "image/png"
+    if n.endswith(".webp"):
+        return "image/webp"
+    if n.endswith(".gif"):
+        return "image/gif"
+    return "image/jpeg"
 
 
 def page_paths(book_id: str, page_index: int) -> tuple[Path, Path, Path]:
@@ -786,8 +828,7 @@ def _persist_page(book_id, owner, page_index, order_dir, title, img_sha, cfg_has
     # 先写文件再落页记录：避免页已标 done 但 out 图还没写好，App 轮询到 done 立刻下载 → 404
     if out_bytes:
         out_path.write_bytes(_to_webp_lossless(out_bytes))
-    if payload:
-        json_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    # result.json 只写不读（结构化结果在 page_blocks 表），不再落盘省空间
     db.execute(
         """INSERT INTO pages (book_id, page_index, order_dir, orig_sha1, config_hash,
                               orig_path, out_path, json_path, status, attempts, error, elapsed_ms, tokens)
@@ -800,7 +841,7 @@ def _persist_page(book_id, owner, page_index, order_dir, title, img_sha, cfg_has
              elapsed_ms=VALUES(elapsed_ms), tokens=VALUES(tokens)""",
         (book_id, page_index, order_dir, img_sha, cfg_hash,
          str(orig_path) if synced is None else None, str(out_path) if out_bytes else None,
-         str(json_path) if payload else None, status, attempts, error, elapsed_ms, tokens))
+         None, status, attempts, error, elapsed_ms, tokens))
     row = db.query_one("SELECT id FROM pages WHERE book_id=%s AND page_index=%s", (book_id, page_index))
     page_id = row["id"]
     if payload:
@@ -1425,12 +1466,20 @@ async def cloud_cover(book_id: str, owner: str = Depends(get_owner)):
     p = Path(row["zip_path"])
     if not p.exists():
         raise HTTPException(410, detail="cloud file missing")
+    # 封面缓存：抽出第一页存成 cloud/<id>/cover.<ext>，之后直接发文件（不用每次解压整个 zip）
+    cover_dir = p.parent
+    cached = next(cover_dir.glob("cover.*"), None)
+    if cached is not None and cached.exists():
+        return FileResponse(cached, media_type=_guess_image_media(cached.name),
+                            headers={"Cache-Control": "public, max-age=31536000, immutable"})
     with zipfile.ZipFile(p) as z:
         names = sorted(n for n in z.namelist() if n.startswith("pages/") and not n.endswith("/"))
         if not names:
             raise HTTPException(404, detail="no cover")
         data = z.read(names[0])
-    return Response(content=data, media_type="image/jpeg")
+    cover_path = cover_dir / f"cover{_image_ext(data)}"
+    await run_in_threadpool(cover_path.write_bytes, data)
+    return Response(content=data, media_type=_guess_image_media(cover_path.name))
 
 
 @app.post("/v1/cloud/books/{book_id}/folder", dependencies=[Depends(auth)])
