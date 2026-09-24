@@ -424,6 +424,20 @@ class LibraryRepository(private val context: Context) {
     /** 从云端下载一本书并还原到本地（页面 + 译文缓存 + 归属文件夹），cloudId 保持云端 id。
      *  onProgress(阶段文案, 0..1 进度；null=不确定)。 */
     suspend fun downloadCloud(cloud: CloudBook, onProgress: ((String, Float?) -> Unit)? = null): Book = withContext(Dispatchers.IO) {
+        // 去重：同一云端书 / 同一内容，重复点「下载」只复用已有本地书，不再造第二本（否则会「下载两次出现两本书」）
+        val cloudHash = cloud.hash ?: ""
+        val existing = readIndexData().books.firstOrNull {
+            it.cloudId == cloud.id || (cloudHash.isNotBlank() && it.hash.isNotEmpty() && it.hash == cloudHash)
+        }
+        if (existing != null) {
+            // 命中同内容但还没挂 cloudId 的（比如先导入了压缩包、后点云端下载）：补挂 cloudId 复用，不新建
+            if (existing.cloudId != cloud.id) {
+                val d0 = readIndexData()
+                writeIndex(d0.books.map { if (it.id == existing.id) it.copy(cloudId = cloud.id) else it }, d0.folders)
+            }
+            return@withContext existing.copy(cloudId = cloud.id)
+        }
+
         val id = UUID.randomUUID().toString()
         val dir = File(root, id).apply { mkdirs() }
         val zipFile = File(context.cacheDir, "dl-${cloud.id}.zip")

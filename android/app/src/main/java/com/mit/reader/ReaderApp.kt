@@ -9,6 +9,7 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.mit.reader.data.Book
+import com.mit.reader.data.CloudBook
 import com.mit.reader.data.LibraryRepository
 import com.mit.reader.data.ReadingMode
 import com.mit.reader.data.ServerConfig
@@ -48,6 +49,9 @@ data class DownloadTask(
     val status: DownloadStatus = DownloadStatus.DOWNLOADING,
     val message: String = "",
 )
+
+/** 同步到云端 / 云端下载还原的一条进度（key 在 ReaderApp.syncTasks 里就是书 id）。 */
+data class SyncTask(val text: String, val frac: Float?)
 
 class ReaderApp : Application() {
     lateinit var library: LibraryRepository
@@ -107,6 +111,63 @@ class ReaderApp : Application() {
     /** 每下好一页译文图就发一次事件 (bookId, pageIndex)：阅读器按书订阅，免轮询。 */
     private val _pageTranslated = MutableSharedFlow<Pair<String, Int>>(extraBufferCapacity = 64)
     val pageTranslated: SharedFlow<Pair<String, Int>> = _pageTranslated.asSharedFlow()
+
+    // ---- 同步到云端 / 云端下载还原（app 级后台，切屏/进阅读器/回桌面都不中断）----
+
+    /** 每本书独立一条同步/下载进度（key=本地书 id 或云端书 id），Compose 可直接观察。 */
+    val syncTasks = mutableStateMapOf<String, SyncTask>()
+
+    private fun setSync(id: String, text: String, frac: Float?) {
+        syncTasks[id] = SyncTask(text, frac)
+    }
+
+    private fun clearSync(id: String) {
+        syncTasks.remove(id)
+    }
+
+    /** 同步一本书到云端：打包 → 上传 → 记录 cloudId。后台进行，不随页面销毁而中断。 */
+    fun syncBook(book: Book) {
+        if (syncTasks.containsKey(book.id)) return   // 同一本正在同步，忽略重复点击
+        appScope.launch {
+            stopTranslatingIf(book.id)   // 同步会迁移 book_id，正在翻就先停，避免轮询到旧 id
+            setSync(book.id, "打包中…", null)
+            try {
+                val synced = library.sync(book) { text, frac ->
+                    // 进度回调在 IO 线程，切回主线程写 Compose 状态
+                    appScope.launch { setSync(book.id, text, frac) }
+                }
+                Toast.makeText(this@ReaderApp, "已同步《${synced.title}》", Toast.LENGTH_SHORT).show()
+                bumpLibrary()
+            } catch (e: CancellationException) {
+                throw e   // 应用级作用域被取消=进程退出，不弹「失败」
+            } catch (e: Exception) {
+                Toast.makeText(this@ReaderApp, "同步失败：${e.message}", Toast.LENGTH_LONG).show()
+            } finally {
+                clearSync(book.id)
+            }
+        }
+    }
+
+    /** 从云端下载一本书还原到本地（后台进行，不随页面销毁而中断）。 */
+    fun downloadCloudBook(cb: CloudBook) {
+        if (syncTasks.containsKey(cb.id)) return
+        appScope.launch {
+            setSync(cb.id, "下载中…", null)
+            try {
+                val book = library.downloadCloud(cb) { text, frac ->
+                    appScope.launch { setSync(cb.id, text, frac) }
+                }
+                Toast.makeText(this@ReaderApp, "已下载《${book.title}》", Toast.LENGTH_SHORT).show()
+                bumpLibrary()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Toast.makeText(this@ReaderApp, "下载失败：${e.message}", Toast.LENGTH_LONG).show()
+            } finally {
+                clearSync(cb.id)
+            }
+        }
+    }
 
     // ---- WebView 后台下载队列（进度页「下载」区查看全部进度，支持暂停/继续/取消/断点续传）----
 

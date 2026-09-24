@@ -65,6 +65,13 @@ class TranslationApi {
         .writeTimeout(120, TimeUnit.SECONDS)
         .build()
 
+    // 下载专用：大文件（180MB 漫画包 / 云端 zip）可能几十秒没数据（服务端限速/缓冲），
+    // 30s 读超时太短会误判失败。这里读超时放宽到 5 分钟，连接超时仍 30s 快速失败。
+    private val downloadClient = OkHttpClient.Builder()
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.MINUTES)
+        .build()
+
     private val base get() = ServerConfig.baseUrl
 
     private fun Request.Builder.authed(): Request.Builder =
@@ -413,7 +420,7 @@ class TranslationApi {
             if (url.startsWith(base)) builder.authed()
             extraHeaders.forEach { (k, v) -> if (v.isNotBlank()) builder.header(k, v) }
             val req = builder.build()
-            client.newCall(req).execute().use { resp ->
+            downloadClient.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code}")
                 val body = resp.body ?: throw IllegalStateException("空响应")
                 val total = body.contentLength()
@@ -448,7 +455,7 @@ class TranslationApi {
         extraHeaders.forEach { (k, v) -> if (v.isNotBlank()) builder.header(k, v) }
         if (resumeFrom > 0) builder.header("Range", "bytes=$resumeFrom-")
         val req = builder.build()
-        client.newCall(req).execute().use { resp ->
+        downloadClient.newCall(req).execute().use { resp ->
             if (resp.code == 416) {
                 // 范围不满足：已下完
                 onProgress?.invoke(resumeFrom, resumeFrom)

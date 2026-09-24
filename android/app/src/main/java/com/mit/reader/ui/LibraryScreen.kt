@@ -88,6 +88,7 @@ import coil.compose.AsyncImage
 import com.mit.reader.DownloadStatus
 import com.mit.reader.DownloadTask
 import com.mit.reader.ReaderApp
+import com.mit.reader.SyncTask
 import com.mit.reader.data.Book
 import com.mit.reader.data.CloudBook
 import com.mit.reader.data.Folder
@@ -129,9 +130,6 @@ private sealed class LibraryEntry {
     data class Cloud(val book: CloudBook) : LibraryEntry()
 }
 
-/** 正在同步/下载的一本书（id=本地书 id 或云端书 id）+ 文案 + 进度。 */
-private data class SyncTask(val id: String, val text: String, val frac: Float?)
-
 /** 云端书在服务端的全书翻译状态，用于书库卡片进度与防重复提交。 */
 private data class CloudTranslationState(
     val status: String?,
@@ -169,7 +167,6 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit, onKmoe: () -
     var cloudErr by remember { mutableStateOf<String?>(null) }
     var serverBooks by remember { mutableStateOf<List<ServerBook>>(emptyList()) }
     var progressErr by remember { mutableStateOf<String?>(null) }
-    var syncTasks by remember { mutableStateOf<Map<String, SyncTask>>(emptyMap()) }
     var cloudSubmittingIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     var gridMode by remember { mutableStateOf(true) }
     var sortMode by remember { mutableStateOf(SortMode.NAME) }
@@ -190,12 +187,6 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit, onKmoe: () -
     val scope = rememberCoroutineScope()
 
     fun reload() { refreshing++ }
-
-    /** 每本书独立一条同步/下载进度（主线程写，多个可同时存在）。 */
-    fun setSync(id: String, text: String, frac: Float?) {
-        syncTasks = syncTasks + (id to SyncTask(id, text, frac))
-    }
-    fun clearSync(id: String) { syncTasks = syncTasks - id }
 
     /** 按当前排序方式排本地书。 */
     fun sortedBooks(list: List<Book>): List<Book> = when (sortMode) {
@@ -257,19 +248,7 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit, onKmoe: () -
     }
 
     fun doSync(book: Book) {
-        scope.launch {
-            app.stopTranslatingIf(book.id)   // 同步会迁移 book_id，正在翻就先停，避免轮询到旧 id
-            setSync(book.id, "打包中…", null)
-            runCatching {
-                app.library.sync(book) { text, frac ->
-                    // 进度回调在 IO 线程，切回主线程写 Compose 状态
-                    scope.launch { setSync(book.id, text, frac) }
-                }
-            }
-                .onSuccess { Toast.makeText(app, "已同步《${it.title}》", Toast.LENGTH_SHORT).show(); reload() }
-                .onFailure { Toast.makeText(app, "同步失败：${it.message}", Toast.LENGTH_LONG).show() }
-            clearSync(book.id)
-        }
+        app.syncBook(book)   // app 级后台：进阅读器/切屏也不中断
     }
 
     fun performCancelSync(book: Book) {
@@ -290,22 +269,18 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit, onKmoe: () -
     }
 
     fun doDownloadCloud(cb: CloudBook) {
-        scope.launch {
-            setSync(cb.id, "下载中…", null)
-            runCatching {
-                app.library.downloadCloud(cb) { text, frac ->
-                    scope.launch { setSync(cb.id, text, frac) }
-                }
-            }
-                .onSuccess { Toast.makeText(app, "已下载《${it.title}》", Toast.LENGTH_SHORT).show(); reload() }
-                .onFailure { Toast.makeText(app, "下载失败：${it.message}", Toast.LENGTH_LONG).show() }
-            clearSync(cb.id)
-        }
+        app.downloadCloudBook(cb)   // app 级后台：进阅读器/切屏也不中断
     }
 
     /** 云端书（未下载到本地）全书翻译：服务端直接从云端 zip 取图翻译，不上传图片。 */
     fun doTranslateAllCloud(cb: CloudBook) {
         val serverBook = serverBooks.firstOrNull { it.id == cb.id }
+        val total = cb.pageCount ?: serverBook?.pageCount ?: 0
+        val done = serverBook?.donePages ?: 0
+        if (total > 0 && done >= total) {
+            Toast.makeText(app, "《${cb.title ?: "未命名"}》已全部翻译完成", Toast.LENGTH_SHORT).show()
+            return
+        }
         val alreadyActive = cb.id in cloudSubmittingIds ||
             serverBook?.jobStatus in setOf("queued", "running") ||
             (serverBook?.activeJobs ?: 0) > 0
@@ -483,7 +458,7 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit, onKmoe: () -
                     onOpenBook = { id -> searchActive = false; searchQuery = ""; onOpen(id) },
                     onEnterFolder = { id -> searchActive = false; searchQuery = ""; currentFolderId = id },
                     onDownloadCloud = { doDownloadCloud(it) },
-                    downloadingCloudIds = syncTasks.keys.toSet(),
+                    downloadingCloudIds = app.syncTasks.keys.toSet(),
                 )
             } else {
                 TabRow(selectedTabIndex = tab) {
@@ -588,10 +563,15 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit, onKmoe: () -
                             total = cb.pageCount ?: serverBook?.pageCount ?: 0,
                         )
                     }
+                    // 已全部翻完的书（服务端 done == 总数）：菜单里「全书翻译」直接显示「已完成」，不再重新提交
+                    val completedServerIds = serverBooks.filter {
+                        (it.pageCount ?: 0) > 0 && it.donePages >= (it.pageCount ?: 0)
+                    }.map { it.id }.toSet()
                     LibraryTab(
                         entries = shownEntries,
                         folders = folders,
                         cloudTranslationStates = cloudTranslationStates,
+                        completedServerIds = completedServerIds,
                         currentFolderId = currentFolderId,
                         lastRead = lastRead,
                         cloudErr = cloudErr,
@@ -618,7 +598,7 @@ fun LibraryScreen(onOpen: (String) -> Unit, onSettings: () -> Unit, onKmoe: () -
                         translatingBookId = app.translatingBookId,
                         translatingProgress = app.translatingProgress,
                         queuedBookIds = app.queuedBookIds.toSet(),
-                        syncTasks = syncTasks,
+                        syncTasks = app.syncTasks,
                         gridMode = gridMode,
                     )
                 }
@@ -786,6 +766,7 @@ private fun LibraryTab(
     entries: List<LibraryEntry>,
     folders: List<Folder>,
     cloudTranslationStates: Map<String, CloudTranslationState>,
+    completedServerIds: Set<String>,
     currentFolderId: String?,
     lastRead: Pair<Book, ReadingProgress>?,
     cloudErr: String?,
@@ -866,6 +847,7 @@ private fun LibraryTab(
                         onCancelSync = { onCancelSync(book) },
                         isTranslating = translatingBookId == book.id,
                         isQueued = book.id in queuedBookIds,
+                        isCompleted = book.serverId in completedServerIds,
                         progressText = if (translatingBookId == book.id) translatingProgress?.let { "${it.first}/${it.second}" } else null,
                         syncTasks = syncTasks,
                     )
@@ -904,6 +886,7 @@ private fun LibraryTab(
                         onCancelSync = { onCancelSync(book) },
                         isTranslating = translatingBookId == book.id,
                         isQueued = book.id in queuedBookIds,
+                        isCompleted = book.serverId in completedServerIds,
                         progressText = if (translatingBookId == book.id) translatingProgress?.let { "${it.first}/${it.second}" } else null,
                         syncTasks = syncTasks,
                     )
@@ -989,6 +972,7 @@ private fun LibraryTab(
                         onCancelSync = { onCancelSync(book) },
                         isTranslating = translatingBookId == book.id,
                         isQueued = book.id in queuedBookIds,
+                        isCompleted = book.serverId in completedServerIds,
                         progressText = if (translatingBookId == book.id) translatingProgress?.let { "${it.first}/${it.second}" } else null,
                         syncTasks = syncTasks,
                     )
@@ -1077,6 +1061,7 @@ private fun LibraryTab(
                         onCancelSync = { onCancelSync(book) },
                         isTranslating = translatingBookId == book.id,
                         isQueued = book.id in queuedBookIds,
+                        isCompleted = book.serverId in completedServerIds,
                         progressText = if (translatingBookId == book.id) translatingProgress?.let { "${it.first}/${it.second}" } else null,
                         syncTasks = syncTasks,
                     )
@@ -1277,6 +1262,7 @@ private fun BookCell(
     onCancelSync: () -> Unit = {},
     isTranslating: Boolean,
     isQueued: Boolean = false,
+    isCompleted: Boolean = false,
     progressText: String?,
     syncTasks: Map<String, SyncTask> = emptyMap(),
 ) {
@@ -1310,9 +1296,9 @@ private fun BookCell(
                 )
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                     DropdownMenuItem(
-                        text = { Text(if (isTranslating) "翻译中…" else if (isQueued) "排队中…" else "全书翻译") },
+                        text = { Text(if (isTranslating) "翻译中…" else if (isQueued) "排队中…" else if (isCompleted) "已完成" else "全书翻译") },
                         onClick = { menuOpen = false; onTranslateAll() },
-                        enabled = !isTranslating && !isQueued,
+                        enabled = !isTranslating && !isQueued && !isCompleted,
                     )
                     if (synced) {
                         DropdownMenuItem(text = { Text("取消同步") }, onClick = { menuOpen = false; onCancelSync() })
@@ -1466,6 +1452,7 @@ private fun CloudCell(
     }
     val coverFile = app.library.cloudCoverFile(cloud.id)
     val translationActive = translation?.active == true
+    val translationCompleted = (translation?.total ?: 0) > 0 && (translation?.done ?: 0) >= (translation?.total ?: 0)
     Column {
         Box(
             Modifier.fillMaxWidth().aspectRatio(0.72f)
@@ -1505,10 +1492,10 @@ private fun CloudCell(
                 DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                     DropdownMenuItem(
                         text = {
-                            Text(if (translationActive) "${cloudTranslationLabel(translation?.status)}…" else "全书翻译")
+                            Text(if (translationActive) "${cloudTranslationLabel(translation?.status)}…" else if (translationCompleted) "已完成" else "全书翻译")
                         },
                         onClick = { menuOpen = false; onTranslateAll() },
-                        enabled = !translationActive,
+                        enabled = !translationActive && !translationCompleted,
                     )
                     DropdownMenuItem(text = { Text("下载到本地") }, onClick = { menuOpen = false; onDownload() })
                     DropdownMenuItem(text = { Text("移动到收藏夹…") }, onClick = { menuOpen = false; onMove() })
@@ -1545,6 +1532,7 @@ private fun BookRow(
     onCancelSync: () -> Unit = {},
     isTranslating: Boolean,
     isQueued: Boolean = false,
+    isCompleted: Boolean = false,
     progressText: String?,
     syncTasks: Map<String, SyncTask> = emptyMap(),
 ) {
@@ -1589,9 +1577,9 @@ private fun BookRow(
             )
             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                 DropdownMenuItem(
-                    text = { Text(if (isTranslating) "翻译中…" else if (isQueued) "排队中…" else "全书翻译") },
+                    text = { Text(if (isTranslating) "翻译中…" else if (isQueued) "排队中…" else if (isCompleted) "已完成" else "全书翻译") },
                     onClick = { menuOpen = false; onTranslateAll() },
-                    enabled = !isTranslating && !isQueued,
+                    enabled = !isTranslating && !isQueued && !isCompleted,
                 )
                 if (synced) {
                     DropdownMenuItem(text = { Text("取消同步") }, onClick = { menuOpen = false; onCancelSync() })
@@ -1627,6 +1615,7 @@ private fun CloudRow(
     LaunchedEffect(cloud.id) { app.library.ensureCloudCover(cloud.id); coverReady = true }
     val coverFile = app.library.cloudCoverFile(cloud.id)
     val translationActive = translation?.active == true
+    val translationCompleted = (translation?.total ?: 0) > 0 && (translation?.done ?: 0) >= (translation?.total ?: 0)
     Row(Modifier.fillMaxWidth().combinedClickable(onClick = {}, onLongClick = onMove).padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
         Box(
             Modifier.size(width = 40.dp, height = 56.dp).clip(MaterialTheme.shapes.small)
@@ -1657,10 +1646,10 @@ private fun CloudRow(
             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                 DropdownMenuItem(
                     text = {
-                        Text(if (translationActive) "${cloudTranslationLabel(translation?.status)}…" else "全书翻译")
+                        Text(if (translationActive) "${cloudTranslationLabel(translation?.status)}…" else if (translationCompleted) "已完成" else "全书翻译")
                     },
                     onClick = { menuOpen = false; onTranslateAll() },
-                    enabled = !translationActive,
+                    enabled = !translationActive && !translationCompleted,
                 )
                 DropdownMenuItem(text = { Text("下载到本地") }, onClick = { menuOpen = false; onDownload() })
                 DropdownMenuItem(text = { Text("移动到收藏夹…") }, onClick = { menuOpen = false; onMove() })
